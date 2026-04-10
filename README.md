@@ -80,3 +80,16 @@ python main.py
 - Auto-detect hit line with edge detection / Hough lines.
 - Adaptive timing learning per song segment.
 - Optional sound feedback (beep per detection/hit result).
+
+
+## Windows .exe Build (PyInstaller)
+
+This project includes a one-click Windows build script:
+
+1. Double-click `build.bat` (or run it from Command Prompt).
+2. The script will automatically install PyInstaller if it is missing.
+3. It builds a single-file, no-console executable.
+
+Output location:
+
+- `dist\BottomBot.exe`
