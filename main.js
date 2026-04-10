@@ -1,13 +1,17 @@
 const path = require('path');
+const os = require('os');
 const { app, BrowserWindow, ipcMain, globalShortcut } = require('electron');
-const robot = require('robotjs');
-const Jimp = require('jimp');
+const { keyboard, Key, Region, Point, imageResource, screen } = require('@nut-tree/nut-js');
 
 const CONFIG = {
-  scanIntervalMs: 100,
-  whiteThreshold: 240,
-  templateThreshold: 38,
-  sampleStep: 2
+  arrowScanIntervalMs: 50,
+  perfectScanIntervalMs: 5,
+  perfectMicroDelayMs: 10,
+  arrowConfidence: 0.85,
+  arrowRegion: new Region(600, 120, 720, 260),
+  perfectPixel: new Point(960, 540),
+  perfectWhiteThreshold: 240,
+  perfectDebounceMs: 120
 };
 
 const TEMPLATE_FILES = {
@@ -17,155 +21,161 @@ const TEMPLATE_FILES = {
   right: 'right.png'
 };
 
+const KEY_MAP = {
+  up: Key.Up,
+  down: Key.Down,
+  left: Key.Left,
+  right: Key.Right
+};
+
 let mainWindow = null;
-let scanTimer = null;
-let isScanning = false;
+let isRunning = false;
+let arrowTimer = null;
+let perfectTimer = null;
+let arrowBusy = false;
+let perfectBusy = false;
+let lastPerfectHitAt = 0;
 let templates = {};
 
-function notifyStatus(isRunning) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send('bot:status', { isRunning });
+function setHighPriority() {
+  try {
+    os.setPriority(process.pid, os.constants.priority.PRIORITY_HIGH);
+    console.log('[Para Pa Bot] Process priority set to HIGH.');
+  } catch (error) {
+    console.warn('[Para Pa Bot] Unable to set HIGH priority:', error.message);
+  }
 }
 
-function notifyArrow(name) {
+function notifyStatus(status) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send('bot:arrow', { name });
+  mainWindow.webContents.send('bot:status', { status, isRunning });
+}
+
+async function tapKey(key) {
+  await keyboard.pressKey(key);
+  await keyboard.releaseKey(key);
 }
 
 async function loadTemplates() {
-  const entries = Object.entries(TEMPLATE_FILES);
-  for (const [name, file] of entries) {
-    templates[name] = await Jimp.read(path.join(__dirname, file));
-  }
+  templates = Object.fromEntries(
+    Object.entries(TEMPLATE_FILES).map(([name, filename]) => [
+      name,
+      imageResource(path.join(__dirname, filename))
+    ])
+  );
 }
 
-function captureScreenToJimp() {
-  const size = robot.getScreenSize();
-  const capture = robot.screen.capture(0, 0, size.width, size.height);
-  const rgbaBuffer = Buffer.alloc(size.width * size.height * 4);
+function parseColor(colorValue) {
+  if (!colorValue) return { r: 0, g: 0, b: 0 };
 
-  for (let y = 0; y < size.height; y += 1) {
-    for (let x = 0; x < size.width; x += 1) {
-      const srcIdx = y * capture.byteWidth + x * capture.bytesPerPixel;
-      const dstIdx = (y * size.width + x) * 4;
-
-      const blue = capture.image[srcIdx + 0];
-      const green = capture.image[srcIdx + 1];
-      const red = capture.image[srcIdx + 2];
-
-      rgbaBuffer[dstIdx + 0] = red;
-      rgbaBuffer[dstIdx + 1] = green;
-      rgbaBuffer[dstIdx + 2] = blue;
-      rgbaBuffer[dstIdx + 3] = 255;
+  if (typeof colorValue === 'string') {
+    const clean = colorValue.replace('#', '').trim();
+    if (clean.length === 6) {
+      const numeric = Number.parseInt(clean, 16);
+      return {
+        r: (numeric >> 16) & 255,
+        g: (numeric >> 8) & 255,
+        b: numeric & 255
+      };
     }
   }
 
-  return new Jimp({ data: rgbaBuffer, width: size.width, height: size.height });
-}
-
-function templateErrorAt(screenImage, templateImage, startX, startY) {
-  let totalDiff = 0;
-  let samples = 0;
-
-  for (let y = 0; y < templateImage.bitmap.height; y += CONFIG.sampleStep) {
-    for (let x = 0; x < templateImage.bitmap.width; x += CONFIG.sampleStep) {
-      const sColor = Jimp.intToRGBA(screenImage.getPixelColor(startX + x, startY + y));
-      const tColor = Jimp.intToRGBA(templateImage.getPixelColor(x, y));
-
-      totalDiff += Math.abs(sColor.r - tColor.r);
-      totalDiff += Math.abs(sColor.g - tColor.g);
-      totalDiff += Math.abs(sColor.b - tColor.b);
-      samples += 3;
-    }
+  if (typeof colorValue === 'object') {
+    return {
+      r: colorValue.r ?? colorValue.red ?? 0,
+      g: colorValue.g ?? colorValue.green ?? 0,
+      b: colorValue.b ?? colorValue.blue ?? 0
+    };
   }
 
-  return totalDiff / samples;
+  return { r: 0, g: 0, b: 0 };
 }
 
-function findArrow(screenImage) {
-  const sw = screenImage.bitmap.width;
-  const sh = screenImage.bitmap.height;
-  const bottomStartY = Math.floor(sh * 0.5);
-  let best = { name: null, error: Number.POSITIVE_INFINITY };
-
-  for (const [name, template] of Object.entries(templates)) {
-    const maxX = sw - template.bitmap.width;
-    const maxY = sh - template.bitmap.height;
-
-    if (maxX <= 0 || maxY <= 0) continue;
-
-    for (let y = bottomStartY; y <= maxY; y += 8) {
-      for (let x = 0; x <= maxX; x += 8) {
-        const error = templateErrorAt(screenImage, template, x, y);
-        if (error < best.error) {
-          best = { name, error };
-        }
-      }
-    }
-  }
-
-  if (best.name && best.error <= CONFIG.templateThreshold) {
-    return best.name;
-  }
-
-  return null;
-}
-
-function checkPerfectHit() {
-  const size = robot.getScreenSize();
-  const cx = Math.floor(size.width / 2);
-  const cy = Math.floor(size.height / 2);
-
-  const hex = robot.getPixelColor(cx, cy);
-  const numeric = parseInt(hex, 16);
-
-  const r = (numeric >> 16) & 255;
-  const g = (numeric >> 8) & 255;
-  const b = numeric & 255;
-
-  if (r > CONFIG.whiteThreshold && g > CONFIG.whiteThreshold && b > CONFIG.whiteThreshold) {
-    robot.keyTap('space');
-  }
-}
-
-async function scanTick() {
-  if (isScanning || !scanTimer) return;
-  isScanning = true;
+async function scanForArrow() {
+  if (!isRunning || arrowBusy) return;
+  arrowBusy = true;
 
   try {
-    const screenImage = captureScreenToJimp();
-    const arrow = findArrow(screenImage);
+    for (const [name, template] of Object.entries(templates)) {
+      try {
+        const match = await screen.find(template, {
+          searchRegion: CONFIG.arrowRegion,
+          confidence: CONFIG.arrowConfidence
+        });
 
-    if (arrow) {
-      robot.keyTap(arrow);
-      notifyArrow(arrow);
+        if (match) {
+          await tapKey(KEY_MAP[name]);
+          notifyStatus('Scanning');
+          return;
+        }
+      } catch {
+        // Template not found in this frame.
+      }
     }
-
-    checkPerfectHit();
   } catch (error) {
-    console.error('[Para Pa Bot] Scan error:', error.message);
+    console.error('[Para Pa Bot] Arrow scan error:', error.message);
   } finally {
-    isScanning = false;
+    arrowBusy = false;
+  }
+}
+
+async function scanPerfectPixel() {
+  if (!isRunning || perfectBusy) return;
+  perfectBusy = true;
+
+  try {
+    const now = Date.now();
+    if (now - lastPerfectHitAt < CONFIG.perfectDebounceMs) return;
+
+    const pixel = await screen.colorAt(CONFIG.perfectPixel);
+    const { r, g, b } = parseColor(pixel);
+
+    if (
+      r >= CONFIG.perfectWhiteThreshold &&
+      g >= CONFIG.perfectWhiteThreshold &&
+      b >= CONFIG.perfectWhiteThreshold
+    ) {
+      notifyStatus('Perfect Active');
+      setTimeout(() => {
+        void tapKey(Key.Space);
+      }, CONFIG.perfectMicroDelayMs);
+      lastPerfectHitAt = Date.now();
+    }
+  } catch (error) {
+    console.error('[Para Pa Bot] Perfect scan error:', error.message);
+  } finally {
+    perfectBusy = false;
   }
 }
 
 function startBot() {
-  if (scanTimer) return;
-  scanTimer = setInterval(() => {
-    void scanTick();
-  }, CONFIG.scanIntervalMs);
-  notifyStatus(true);
+  if (isRunning) return;
+  isRunning = true;
+  notifyStatus('Scanning');
+
+  arrowTimer = setInterval(() => {
+    void scanForArrow();
+  }, CONFIG.arrowScanIntervalMs);
+
+  perfectTimer = setInterval(() => {
+    void scanPerfectPixel();
+  }, CONFIG.perfectScanIntervalMs);
 }
 
 function stopBot() {
-  if (!scanTimer) return;
-  clearInterval(scanTimer);
-  scanTimer = null;
-  notifyStatus(false);
+  if (!isRunning) return;
+  isRunning = false;
+
+  if (arrowTimer) clearInterval(arrowTimer);
+  if (perfectTimer) clearInterval(perfectTimer);
+
+  arrowTimer = null;
+  perfectTimer = null;
+  notifyStatus('Waiting');
 }
 
 function toggleBot() {
-  if (scanTimer) {
+  if (isRunning) {
     stopBot();
   } else {
     startBot();
@@ -174,11 +184,11 @@ function toggleBot() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 300,
-    height: 400,
-    alwaysOnTop: true,
+    width: 250,
+    height: 350,
     resizable: false,
-    backgroundColor: '#0a0d15',
+    alwaysOnTop: true,
+    backgroundColor: '#0e1118',
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false
@@ -191,24 +201,23 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  setHighPriority();
+
+  keyboard.config.autoDelayMs = 0;
   await loadTemplates();
   createWindow();
 
-  globalShortcut.register('F10', () => {
+  globalShortcut.register('F10', toggleBot);
+
+  ipcMain.handle('bot:toggle', () => {
     toggleBot();
+    return { isRunning, status: isRunning ? 'Scanning' : 'Waiting' };
   });
 
-  ipcMain.handle('bot:start', () => {
-    startBot();
-    return { isRunning: true };
-  });
-
-  ipcMain.handle('bot:stop', () => {
-    stopBot();
-    return { isRunning: false };
-  });
-
-  ipcMain.handle('bot:state', () => ({ isRunning: Boolean(scanTimer) }));
+  ipcMain.handle('bot:state', () => ({
+    isRunning,
+    status: isRunning ? 'Scanning' : 'Waiting'
+  }));
 });
 
 app.on('will-quit', () => {

@@ -5,163 +5,128 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Para Pa Bot</title>
     <style>
-      :root { color-scheme: dark; }
-      * { box-sizing: border-box; }
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
       body {
         margin: 0;
-        min-height: 100vh;
-        font-family: Inter, Segoe UI, Roboto, Arial, sans-serif;
-        background: radial-gradient(circle at top, #1d2330 0%, #0f1117 45%, #090b10 100%);
-        color: #eef2ff;
+        width: 100vw;
+        height: 100vh;
         display: flex;
         align-items: center;
         justify-content: center;
-        padding: 14px;
+        font-family: Inter, Segoe UI, Roboto, Arial, sans-serif;
+        background: #0a0d14;
+        color: #eef2ff;
       }
       .panel {
-        width: 100%;
-        max-width: 280px;
-        background: rgba(19, 23, 33, 0.95);
-        border: 1px solid #2a2f3b;
-        border-radius: 14px;
+        width: 220px;
         padding: 16px;
-        box-shadow: 0 16px 30px rgba(0, 0, 0, 0.45);
+        border-radius: 12px;
+        border: 1px solid #2b3244;
+        background: #101623;
+        box-shadow: 0 12px 24px rgba(0, 0, 0, 0.45);
       }
-      h1 { margin: 0 0 12px; text-align: center; font-size: 20px; letter-spacing: 0.4px; }
-      .subtitle { margin: -4px 0 14px; text-align: center; color: #9aa4bf; font-size: 12px; }
-      .status {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 8px;
-        margin-bottom: 14px;
+      .title {
+        margin: 0;
+        text-align: center;
+        font-size: 18px;
       }
-      .dot {
-        width: 10px;
-        height: 10px;
-        border-radius: 999px;
-        background: #ef4444;
-        box-shadow: 0 0 10px rgba(239, 68, 68, 0.9);
+      .status-wrap {
+        margin-top: 16px;
+        text-align: center;
       }
-      .dot.running {
-        background: #22c55e;
-        box-shadow: 0 0 12px rgba(34, 197, 94, 0.95);
+      .status-label {
+        font-size: 12px;
+        color: #9aa6c9;
       }
-      .status-label { font-size: 14px; color: #dbe4ff; }
-      .btn-grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 10px;
-        margin-bottom: 14px;
+      .status-value {
+        margin-top: 6px;
+        font-size: 16px;
+        font-weight: 700;
       }
-      button {
+      .status-value.waiting {
+        color: #94a3b8;
+      }
+      .status-value.scanning {
+        color: #22c55e;
+      }
+      .status-value.perfect {
+        color: #f97316;
+      }
+      #toggleBtn {
+        margin-top: 18px;
+        width: 100%;
         border: none;
         border-radius: 10px;
         padding: 11px;
+        font-size: 14px;
         font-weight: 700;
+        background: #2563eb;
+        color: #eff6ff;
         cursor: pointer;
       }
-      #startBtn { background: #22c55e; color: #052e16; }
-      #stopBtn { background: #ef4444; color: #3c0b0b; }
-      .detect-title { font-size: 12px; color: #98a5c6; margin-bottom: 8px; text-align: center; }
-      .arrows {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 8px;
+      #toggleBtn.active {
+        background: #ef4444;
       }
-      .arrow {
-        height: 44px;
-        border-radius: 9px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: #161b27;
-        border: 1px solid #2f3a4f;
-        color: #9db0d8;
-        transition: all 0.12s linear;
+      .hint {
+        margin-top: 12px;
+        text-align: center;
+        color: #8390b1;
+        font-size: 11px;
       }
-      .arrow.active {
-        background: #2563eb;
-        border-color: #93c5fd;
-        color: #eff6ff;
-        box-shadow: 0 0 14px rgba(37, 99, 235, 0.7);
-      }
-      .spacer { visibility: hidden; }
-      .hint { margin-top: 12px; text-align: center; color: #8894b1; font-size: 11px; }
     </style>
   </head>
   <body>
     <main class="panel">
-      <h1>Para Pa Bot</h1>
-      <p class="subtitle">Electron + RobotJS + Jimp</p>
+      <h1 class="title">Para Pa Bot</h1>
 
-      <div class="status">
-        <span id="statusDot" class="dot"></span>
-        <span id="statusText" class="status-label">Stopped</span>
+      <div class="status-wrap">
+        <div class="status-label">Status</div>
+        <div id="statusText" class="status-value waiting">Waiting</div>
       </div>
 
-      <div class="btn-grid">
-        <button id="startBtn" type="button">START BOT</button>
-        <button id="stopBtn" type="button">STOP BOT</button>
-      </div>
-
-      <div class="detect-title">Arrow Detection Feedback</div>
-      <div class="arrows">
-        <div class="spacer">.</div>
-        <div id="up" class="arrow">↑</div>
-        <div class="spacer">.</div>
-        <div id="left" class="arrow">←</div>
-        <div id="down" class="arrow">↓</div>
-        <div id="right" class="arrow">→</div>
-      </div>
-
-      <div class="hint">F10 toggles bot start/stop globally.</div>
+      <button id="toggleBtn" type="button">START</button>
+      <div class="hint">Global toggle: F10</div>
     </main>
 
     <script>
       const { ipcRenderer } = require('electron');
-      const statusDot = document.getElementById('statusDot');
+      const toggleBtn = document.getElementById('toggleBtn');
       const statusText = document.getElementById('statusText');
-      const arrows = {
-        up: document.getElementById('up'),
-        down: document.getElementById('down'),
-        left: document.getElementById('left'),
-        right: document.getElementById('right')
-      };
 
-      function setStatus(isRunning) {
-        statusText.textContent = isRunning ? 'Running' : 'Stopped';
-        statusDot.classList.toggle('running', isRunning);
+      function setStatus(status, isRunning) {
+        const normalized = String(status || 'Waiting');
+        statusText.textContent = normalized;
+
+        statusText.classList.remove('waiting', 'scanning', 'perfect');
+        if (normalized === 'Perfect Active') {
+          statusText.classList.add('perfect');
+        } else if (normalized === 'Scanning') {
+          statusText.classList.add('scanning');
+        } else {
+          statusText.classList.add('waiting');
+        }
+
+        toggleBtn.textContent = isRunning ? 'STOP' : 'START';
+        toggleBtn.classList.toggle('active', isRunning);
       }
 
-      function pulseArrow(name) {
-        const el = arrows[name];
-        if (!el) return;
-        el.classList.add('active');
-        setTimeout(() => el.classList.remove('active'), 150);
-      }
-
-      document.getElementById('startBtn').addEventListener('click', async () => {
-        const state = await ipcRenderer.invoke('bot:start');
-        setStatus(Boolean(state?.isRunning));
-      });
-
-      document.getElementById('stopBtn').addEventListener('click', async () => {
-        const state = await ipcRenderer.invoke('bot:stop');
-        setStatus(Boolean(state?.isRunning));
+      toggleBtn.addEventListener('click', async () => {
+        const state = await ipcRenderer.invoke('bot:toggle');
+        setStatus(state?.status, Boolean(state?.isRunning));
       });
 
       ipcRenderer.on('bot:status', (_event, payload) => {
-        setStatus(Boolean(payload?.isRunning));
-      });
-
-      ipcRenderer.on('bot:arrow', (_event, payload) => {
-        pulseArrow(payload?.name);
+        setStatus(payload?.status, Boolean(payload?.isRunning));
       });
 
       (async () => {
         const state = await ipcRenderer.invoke('bot:state');
-        setStatus(Boolean(state?.isRunning));
+        setStatus(state?.status, Boolean(state?.isRunning));
       })();
     </script>
   </body>
