@@ -1,17 +1,14 @@
 {
-  "name": "bottombot",
+  "name": "parapa-electron-bot",
   "version": "1.0.0",
-  "description": "Rhythm bot for Para Pa: City of Dances",
-  "main": "bot.js",
+  "description": "Desktop rhythm automation bot using Electron + nut-js",
+  "main": "main.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node bot.js"
+    "start": "electron ."
   },
   "dependencies": {
     "@nut-tree/nut-js": "^4.3.0",
-    "active-win": "^8.1.0",
-    "iohook": "^0.9.3",
-    "opencv4nodejs": "^5.6.0",
-    "screenshot-desktop": "^1.15.0"
+    "electron": "^31.7.7"
   }
 }
