@@ -1,15 +1,14 @@
 {
   "name": "parapa-electron-bot",
-  "version": "2.0.0",
-  "description": "Para Pa game bot desktop app built with Electron, RobotJS, and Jimp",
+  "version": "3.0.0",
+  "description": "Electron + nut-js rhythm assistant shell",
   "main": "main.js",
   "type": "commonjs",
   "scripts": {
     "start": "electron ."
   },
   "dependencies": {
-    "electron": "^31.7.7",
-    "jimp": "^0.22.12",
-    "robotjs": "^0.6.0"
+    "@nut-tree/nut-js": "^4.2.2",
+    "electron": "^31.7.7"
   }
 }
