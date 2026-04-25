@@ -1,54 +1,208 @@
-import cv2
-import numpy as np
-import mss
-import pyautogui
-import customtkinter as ctk
+import random
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 
-class MiniBot:
+import customtkinter as ctk
+import cv2
+import mss
+import numpy as np
+import pyautogui
+
+
+class SmartDancer:
     def __init__(self):
         self.window = ctk.CTk()
-        self.window.title("AutoDance")
-        self.window.geometry("300x200")
+        self.window.title("Smart Dancer 1600x900")
+        self.window.geometry("520x420")
         self.window.attributes("-topmost", True)
-        
-        self.is_active = False
-        
-        self.btn = ctk.CTkButton(self.window, text="СТАРТ", command=self.switch)
-        self.btn.pack(pady=40)
-        
-        self.label = ctk.CTkLabel(self.window, text="Статус: Выключен")
-        self.label.pack()
 
-    def switch(self):
-        if not self.is_active:
-            self.is_active = True
-            self.btn.configure(text="СТОП", fg_color="red")
-            self.label.configure(text="Статус: РАБОТАЕТ")
-            threading.Thread(target=self.run_logic, daemon=True).start()
-        else:
+        self.is_active = False
+        self.last_combo_signature = None
+
+        self.capture_zone = {"top": 650, "left": 400, "width": 800, "height": 250}
+        self.match_threshold = 0.8
+        self.perfect_brightness_threshold = 200
+
+        self.arrow_templates = self._load_arrow_templates()
+        pyautogui.PAUSE = 0
+        pyautogui.FAILSAFE = False
+
+        self._build_ui()
+
+    def _build_ui(self):
+        self.start_button = ctk.CTkButton(self.window, text="СТАРТ", command=self.toggle)
+        self.start_button.pack(pady=(16, 8))
+
+        self.status_label = ctk.CTkLabel(self.window, text="Статус: Выключен")
+        self.status_label.pack(pady=(0, 8))
+
+        zone_text = (
+            f"Зона поиска: top={self.capture_zone['top']}, left={self.capture_zone['left']}, "
+            f"width={self.capture_zone['width']}, height={self.capture_zone['height']}"
+        )
+        self.zone_label = ctk.CTkLabel(self.window, text=zone_text)
+        self.zone_label.pack(pady=(0, 10))
+
+        self.log_box = ctk.CTkTextbox(self.window, width=490, height=270)
+        self.log_box.pack(padx=14, pady=(0, 14))
+        self.log_box.insert("end", "Лог Smart Dancer\n")
+        self.log_box.configure(state="disabled")
+
+    def _load_arrow_templates(self):
+        assets_dir = Path("assets")
+        files = {
+            "up": "up.png",
+            "down": "down.png",
+            "left": "left.png",
+            "right": "right.png",
+        }
+
+        templates = {}
+        for key, file_name in files.items():
+            template_path = assets_dir / file_name
+            template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
+            if template is None:
+                raise FileNotFoundError(f"Не найден шаблон стрелки: {template_path}")
+            templates[key] = template
+        return templates
+
+    def _append_log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = f"[{timestamp}] {message}\n"
+
+        def update_ui():
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", line)
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+
+        self.window.after(0, update_ui)
+
+    def toggle(self):
+        if self.is_active:
             self.is_active = False
-            self.btn.configure(text="СТАРТ", fg_color=["#3a7ebf", "#1f538d"])
-            self.label.configure(text="Статус: Выключен")
+            self.start_button.configure(text="СТАРТ", fg_color=["#3a7ebf", "#1f538d"])
+            self.status_label.configure(text="Статус: Выключен")
+            self._append_log("Бот остановлен")
+            return
+
+        self.is_active = True
+        self.last_combo_signature = None
+        self.start_button.configure(text="СТОП", fg_color="red")
+        self.status_label.configure(text="Статус: Работает")
+        self._append_log("Бот запущен")
+        threading.Thread(target=self.run_logic, daemon=True).start()
+
+    def find_combo(self, gray_frame):
+        detections = []
+
+        for direction, template in self.arrow_templates.items():
+            result = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
+            locations = np.where(result >= self.match_threshold)
+            template_h, template_w = template.shape
+
+            for y, x in zip(*locations):
+                score = float(result[y, x])
+                detections.append(
+                    {
+                        "direction": direction,
+                        "x": int(x),
+                        "y": int(y),
+                        "center_x": int(x + template_w / 2),
+                        "center_y": int(y + template_h / 2),
+                        "w": template_w,
+                        "h": template_h,
+                        "score": score,
+                    }
+                )
+
+        if not detections:
+            return []
+
+        detections.sort(key=lambda item: item["score"], reverse=True)
+        filtered = []
+        for det in detections:
+            is_duplicate = False
+            for kept in filtered:
+                if abs(det["center_x"] - kept["center_x"]) <= max(det["w"], kept["w"]) * 0.55 and abs(
+                    det["center_y"] - kept["center_y"]
+                ) <= max(det["h"], kept["h"]) * 0.55:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                filtered.append(det)
+
+        filtered.sort(key=lambda item: item["center_x"])
+        return filtered
+
+    def press_combo(self, combo):
+        for item in combo:
+            pyautogui.press(item["direction"])
+            time.sleep(random.uniform(0.02, 0.05))
+
+    def wait_and_press_space(self, color_frame, timeout=1.25):
+        height = color_frame.shape[0]
+        width = color_frame.shape[1]
+
+        zone_top = max(0, int(height * 0.22))
+        zone_bottom = max(zone_top + 1, int(height * 0.38))
+        zone_left = int(width * 0.10)
+        zone_right = int(width * 0.90)
+
+        monitor = {
+            "top": self.capture_zone["top"] + zone_top,
+            "left": self.capture_zone["left"] + zone_left,
+            "width": zone_right - zone_left,
+            "height": zone_bottom - zone_top,
+        }
+
+        start = time.perf_counter()
+        with mss.mss() as sct:
+            while self.is_active and (time.perf_counter() - start) < timeout:
+                perfect_region = np.array(sct.grab(monitor))
+                gray = cv2.cvtColor(perfect_region, cv2.COLOR_BGRA2GRAY)
+                avg_intensity = float(np.mean(gray))
+                max_intensity = int(np.max(gray))
+
+                if max_intensity > self.perfect_brightness_threshold or avg_intensity > self.perfect_brightness_threshold:
+                    pyautogui.press("space")
+                    self._append_log(
+                        f"Space нажат (max={max_intensity}, avg={avg_intensity:.1f}, порог={self.perfect_brightness_threshold})"
+                    )
+                    return True
+
+                time.sleep(0.001)
+
+        return False
 
     def run_logic(self):
-        # Координаты 1600x900
-        zone = {"top": 720, "left": 400, "width": 800, "height": 120}
-        template = cv2.imread('assets/down.png', cv2.IMREAD_GRAYSCALE)
-        
         with mss.mss() as sct:
             while self.is_active:
-                img = np.array(sct.grab(zone))
-                gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-                
-                if template is not None:
-                    res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-                    if np.any(res > 0.8):
-                        pyautogui.press('down')
-                        time.sleep(0.05)
-                time.sleep(0.1)
+                frame = np.array(sct.grab(self.capture_zone))
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+
+                combo = self.find_combo(gray)
+                if not combo:
+                    time.sleep(0.002)
+                    continue
+
+                signature = tuple((item["direction"], item["center_x"]) for item in combo)
+                if signature == self.last_combo_signature:
+                    time.sleep(0.002)
+                    continue
+
+                self.last_combo_signature = signature
+                combo_text = " ".join(item["direction"] for item in combo)
+                self._append_log(f"Комбинация: {combo_text}")
+
+                self.press_combo(combo)
+                self.wait_and_press_space(frame)
+
+                time.sleep(0.005)
+
 
 if __name__ == "__main__":
-    bot = MiniBot()
-    bot.window.mainloop()
+    dancer = SmartDancer()
+    dancer.window.mainloop()
