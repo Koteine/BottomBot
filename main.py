@@ -51,6 +51,12 @@ class OverlayWindow:
         except Exception:
             pass
 
+        # Не перехватывать фокус/мышь — клик проходит в игру.
+        try:
+            self.window.attributes("-disabled", True)
+        except Exception:
+            pass
+
         self.canvas = ctk.CTkCanvas(self.window, bg="white", bd=0, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.rect_id = self.canvas.create_rectangle(1, 1, 10, 10, outline=self.color_default, width=2)
@@ -67,6 +73,15 @@ class OverlayWindow:
 
     def set_color(self, color: str) -> None:
         self.canvas.itemconfigure(self.rect_id, outline=color)
+
+    def get_screen_region(self) -> CaptureRegion:
+        self.window.update_idletasks()
+        return CaptureRegion(
+            left=int(self.window.winfo_rootx()),
+            top=int(self.window.winfo_rooty()),
+            width=max(20, int(self.window.winfo_width())),
+            height=max(20, int(self.window.winfo_height())),
+        )
 
     def mark_failure(self) -> None:
         self.set_color(self.color_default)
@@ -158,18 +173,23 @@ class BotBackend:
         preset = RATING_PRESETS.get(rating_mode, RATING_PRESETS["Круто"])
         self.perfect_brightness_threshold = preset["perfect_brightness"]
 
-    def _detect_keys(self, gray_frame: np.ndarray) -> list[str]:
+    def _detect_keys(self, gray_frame: np.ndarray) -> tuple[list[str], dict[str, float]]:
         blurred = cv2.GaussianBlur(gray_frame, (3, 3), 0)
         detections = []
+        scores: dict[str, float] = {}
+
         for direction, template in self.templates.items():
             res = cv2.matchTemplate(blurred, template, cv2.TM_CCOEFF_NORMED)
-            ys, xs = np.where(res >= self.template_threshold)
-            h, w = template.shape
-            for y, x in zip(ys, xs):
-                detections.append((direction, int(x + w / 2), int(y + h / 2)))
+            _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(res)
+            score = float(max_val)
+            if score >= self.template_threshold:
+                h, w = template.shape
+                center_x = int(max_loc[0] + w / 2)
+                detections.append((direction, center_x))
+                scores[direction] = score
 
         detections.sort(key=lambda t: t[1])
-        return [d[0] for d in detections]
+        return [direction for direction, _x in detections], scores
 
     def _trigger_has_arrow(self, gray_trigger: np.ndarray) -> bool:
         blurred = cv2.GaussianBlur(gray_trigger, (3, 3), 0)
@@ -182,9 +202,9 @@ class BotBackend:
     @staticmethod
     def _press_combo(keys: list[str]) -> None:
         for key in keys:
-            pydirectinput.keyDown(key, _pause=False)
-            time.sleep(0.02)
-            pydirectinput.keyUp(key, _pause=False)
+            pydirectinput.keyDown(key)
+            time.sleep(0.05)
+            pydirectinput.keyUp(key)
 
     def _wait_perfect_and_space(self, sct: mss.mss, region: dict) -> bool:
         timeout_sec = 1.8
@@ -194,9 +214,9 @@ class BotBackend:
             bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             brightness = int(np.max(bgr))
             if brightness >= self.perfect_brightness_threshold:
-                pydirectinput.keyDown("space", _pause=False)
-                time.sleep(0.02)
-                pydirectinput.keyUp("space", _pause=False)
+                pydirectinput.keyDown("space")
+                time.sleep(0.05)
+                pydirectinput.keyUp("space")
                 self.log(f"Perfect: {brightness} -> SPACE")
                 self.set_action(f"SPACE ({brightness})")
                 return True
@@ -212,7 +232,11 @@ class BotBackend:
         self._worker.start()
         self.set_status("Статус: Запущен")
         self.set_action("Сканирование")
+        pydirectinput.keyDown("space")
+        time.sleep(0.05)
+        pydirectinput.keyUp("space")
         self.log("Бот запущен")
+        self.log("Тест управления: SPACE прожат после нажатия СТАРТ")
 
     def stop(self) -> None:
         if not self.is_active:
@@ -229,6 +253,9 @@ class BotBackend:
     def _worker_loop(self) -> None:
         with mss.mss() as sct:
             vision_locked_until = 0.0
+            last_scan_log_t = 0.0
+            last_scan_region: tuple[int, int, int, int] | None = None
+
             while self.is_active and not self._stop_event.is_set():
                 region = self.get_capture_region()
                 monitor = {
@@ -239,6 +266,11 @@ class BotBackend:
                 }
 
                 now = time.perf_counter()
+                region_tuple = (region.left, region.top, region.width, region.height)
+                if now - last_scan_log_t >= 1.0 or region_tuple != last_scan_region:
+                    self.log(f"Сканирую область [{region.left}, {region.top}, {region.width}, {region.height}]...")
+                    last_scan_log_t = now
+                    last_scan_region = region_tuple
                 if now < vision_locked_until:
                     time.sleep(self.scan_cooldown_sec)
                     continue
@@ -254,11 +286,14 @@ class BotBackend:
                     time.sleep(self.scan_cooldown_sec)
                     continue
 
-                keys = self._detect_keys(full_gray)
+                keys, scores = self._detect_keys(full_gray)
                 if not keys:
                     self.vision_feedback(False)
                     time.sleep(self.scan_cooldown_sec)
                     continue
+
+                for key in keys:
+                    self.log(f"Найдена стрелка: {key} с точностью {scores.get(key, 0.0):.3f}")
 
                 self.vision_feedback(True)
                 vision_locked_until = time.perf_counter() + self.beat_lock_sec
@@ -280,8 +315,8 @@ class AristocratUI:
 
         self.root = ctk.CTk()
         self.root.title("BottomBot DX")
-        self.root.geometry("560x520")
-        self.root.minsize(540, 500)
+        self.root.geometry("460x420")
+        self.root.minsize(430, 390)
         self.root.resizable(True, True)
         self.root.configure(fg_color="#11081f")
         self.root.attributes("-topmost", True)
@@ -431,7 +466,8 @@ class AristocratUI:
             height=max(20, int(self.region_h_var.get())),
         )
         self.overlay.update_region(region)
-        self.backend.set_capture_region(region.left, region.top, region.width, region.height)
+        screen_region = self.overlay.get_screen_region()
+        self.backend.set_capture_region(screen_region.left, screen_region.top, screen_region.width, screen_region.height)
 
     def _sync_backend(self) -> None:
         self.backend.update_settings(
