@@ -15,18 +15,30 @@ class SmartDancer:
     def __init__(self):
         self.window = ctk.CTk()
         self.window.title("Smart Dancer 1600x900")
-        self.window.geometry("520x420")
+        self.window.geometry("560x560")
         self.window.attributes("-topmost", True)
 
         self.is_active = False
         self.last_combo_signature = None
 
-        self.capture_zone = {"top": 650, "left": 400, "width": 800, "height": 250}
+        # Зоны захвата (ориентированы под 1600x900)
+        self.arrow_zone = {"top": 650, "left": 400, "width": 800, "height": 250}
+        self.perfect_zone = {"top": 540, "left": 760, "width": 40, "height": 170}
+
+        # Логика распознавания и таймингов
         self.match_threshold = 0.8
-        self.perfect_brightness_threshold = 235
-        self.space_offset = 0.02
-        self.perfect_zone_left = 770
-        self.perfect_zone_width = 130
+        self.perfect_brightness_threshold = 230
+        self.space_delay_ms = 20
+        self.space_cooldown_sec = 1.0
+        self.wait_for_flash_timeout = 1.25
+
+        # Переключатели режима
+        self.auto_arrows_var = ctk.BooleanVar(value=True)
+        self.auto_space_var = ctk.BooleanVar(value=True)
+
+        self.awaiting_perfect_flash = False
+        self.awaiting_since = 0.0
+        self.last_space_press_at = 0.0
 
         self.arrow_templates = self._load_arrow_templates()
         pyautogui.PAUSE = 0
@@ -36,22 +48,89 @@ class SmartDancer:
 
     def _build_ui(self):
         self.start_button = ctk.CTkButton(self.window, text="СТАРТ", command=self.toggle)
-        self.start_button.pack(pady=(16, 8))
+        self.start_button.pack(pady=(14, 8))
 
         self.status_label = ctk.CTkLabel(self.window, text="Статус: Выключен")
-        self.status_label.pack(pady=(0, 8))
+        self.status_label.pack(pady=(0, 10))
 
-        zone_text = (
-            f"Зона поиска: top={self.capture_zone['top']}, left={self.capture_zone['left']}, "
-            f"width={self.capture_zone['width']}, height={self.capture_zone['height']}"
+        self.auto_arrows_switch = ctk.CTkSwitch(
+            self.window,
+            text="Авто-стрелки",
+            variable=self.auto_arrows_var,
+            onvalue=True,
+            offvalue=False,
         )
-        self.zone_label = ctk.CTkLabel(self.window, text=zone_text)
+        self.auto_arrows_switch.pack(pady=(0, 6))
+
+        self.auto_space_switch = ctk.CTkSwitch(
+            self.window,
+            text="Авто-пробел",
+            variable=self.auto_space_var,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.auto_space_switch.pack(pady=(0, 10))
+
+        delay_frame = ctk.CTkFrame(self.window)
+        delay_frame.pack(padx=14, pady=(0, 10), fill="x")
+
+        ctk.CTkLabel(delay_frame, text="Задержка пробела (ms)").pack(anchor="w", padx=10, pady=(8, 2))
+
+        self.delay_slider = ctk.CTkSlider(
+            delay_frame,
+            from_=0,
+            to=250,
+            number_of_steps=250,
+            command=self._on_delay_slider,
+        )
+        self.delay_slider.pack(fill="x", padx=10, pady=(0, 8))
+        self.delay_slider.set(self.space_delay_ms)
+
+        self.delay_entry = ctk.CTkEntry(delay_frame)
+        self.delay_entry.pack(fill="x", padx=10, pady=(0, 10))
+        self.delay_entry.insert(0, str(self.space_delay_ms))
+        self.delay_entry.bind("<Return>", self._on_delay_entry)
+        self.delay_entry.bind("<FocusOut>", self._on_delay_entry)
+
+        arrow_text = (
+            f"arrow_zone: top={self.arrow_zone['top']}, left={self.arrow_zone['left']}, "
+            f"w={self.arrow_zone['width']}, h={self.arrow_zone['height']}"
+        )
+        perfect_text = (
+            f"perfect_zone: top={self.perfect_zone['top']}, left={self.perfect_zone['left']}, "
+            f"w={self.perfect_zone['width']}, h={self.perfect_zone['height']}"
+        )
+
+        self.zone_label = ctk.CTkLabel(self.window, text=f"{arrow_text}\n{perfect_text}")
         self.zone_label.pack(pady=(0, 10))
 
-        self.log_box = ctk.CTkTextbox(self.window, width=490, height=270)
-        self.log_box.pack(padx=14, pady=(0, 14))
+        self.log_box = ctk.CTkTextbox(self.window, width=525, height=255)
+        self.log_box.pack(padx=14, pady=(0, 14), fill="both", expand=True)
         self.log_box.insert("end", "Лог Smart Dancer\n")
         self.log_box.configure(state="disabled")
+
+    def _on_delay_slider(self, value):
+        ms = int(round(float(value)))
+        self.space_delay_ms = ms
+        self.delay_entry.delete(0, "end")
+        self.delay_entry.insert(0, str(ms))
+
+    def _on_delay_entry(self, _event=None):
+        raw = self.delay_entry.get().strip()
+        if not raw:
+            raw = "0"
+
+        try:
+            ms = int(raw)
+        except ValueError:
+            ms = self.space_delay_ms
+
+        ms = max(0, min(250, ms))
+        self.space_delay_ms = ms
+        self.delay_slider.set(ms)
+
+        self.delay_entry.delete(0, "end")
+        self.delay_entry.insert(0, str(ms))
 
     def _load_arrow_templates(self):
         assets_dir = Path("assets")
@@ -93,6 +172,8 @@ class SmartDancer:
 
         self.is_active = True
         self.last_combo_signature = None
+        self.awaiting_perfect_flash = False
+        self.awaiting_since = 0.0
         self.start_button.configure(text="СТОП", fg_color="red")
         self.status_label.configure(text="Статус: Работает")
         self._append_log("Бот запущен")
@@ -145,59 +226,58 @@ class SmartDancer:
             pyautogui.press(item["direction"])
             time.sleep(random.uniform(0.02, 0.05))
 
-    def wait_and_press_space(self, color_frame, timeout=1.25):
-        height = color_frame.shape[0]
-        width = color_frame.shape[1]
+    def _enter_wait_for_flash(self):
+        self.awaiting_perfect_flash = True
+        self.awaiting_since = time.perf_counter()
+        self._append_log("Режим: ожидание вспышки Perfect")
 
-        zone_top = max(0, int(height * 0.22))
-        zone_bottom = max(zone_top + 1, int(height * 0.38))
-        zone_left = self.perfect_zone_left - self.capture_zone["left"]
-        zone_left = max(0, min(width - self.perfect_zone_width, zone_left))
-        zone_right = zone_left + self.perfect_zone_width
+    def _maybe_press_space_on_flash(self, perfect_gray):
+        if not self.awaiting_perfect_flash:
+            return
 
-        monitor = {
-            "top": self.capture_zone["top"] + zone_top,
-            "left": self.capture_zone["left"] + zone_left,
-            "width": zone_right - zone_left,
-            "height": zone_bottom - zone_top,
-        }
+        now = time.perf_counter()
+        if (now - self.awaiting_since) > self.wait_for_flash_timeout:
+            self.awaiting_perfect_flash = False
+            self._append_log("Таймаут ожидания Perfect")
+            return
 
-        start = time.perf_counter()
-        threshold_reached = False
-        prev_max_intensity = None
-        with mss.mss() as sct:
-            while self.is_active and (time.perf_counter() - start) < timeout:
-                perfect_region = np.array(sct.grab(monitor))
-                gray = cv2.cvtColor(perfect_region, cv2.COLOR_BGRA2GRAY)
-                avg_intensity = float(np.mean(gray))
-                max_intensity = int(np.max(gray))
+        max_intensity = int(np.max(perfect_gray))
+        if max_intensity < self.perfect_brightness_threshold:
+            return
 
-                if max_intensity >= self.perfect_brightness_threshold:
-                    threshold_reached = True
+        if (now - self.last_space_press_at) < self.space_cooldown_sec:
+            self.awaiting_perfect_flash = False
+            self._append_log("Perfect пойман, но Space в кулдауне")
+            return
 
-                if threshold_reached and prev_max_intensity is not None and max_intensity < prev_max_intensity:
-                    time.sleep(self.space_offset)
-                    pyautogui.keyDown("space")
-                    time.sleep(0.05)
-                    pyautogui.keyUp("space")
-                    self._append_log(
-                        f"Space нажат по пику (max={max_intensity}, prev={prev_max_intensity}, avg={avg_intensity:.1f}, порог={self.perfect_brightness_threshold}, offset={self.space_offset:.3f})"
-                    )
-                    return True
+        delay_sec = self.space_delay_ms / 1000.0
+        if delay_sec > 0:
+            time.sleep(delay_sec)
 
-                prev_max_intensity = max_intensity
+        pyautogui.keyDown("space")
+        time.sleep(0.045)
+        pyautogui.keyUp("space")
 
-                time.sleep(0.001)
-
-        return False
+        self.last_space_press_at = time.perf_counter()
+        self.awaiting_perfect_flash = False
+        self._append_log(
+            f"Space нажат по вспышке (max={max_intensity}, порог={self.perfect_brightness_threshold}, delay={self.space_delay_ms}ms)"
+        )
 
     def run_logic(self):
         with mss.mss() as sct:
             while self.is_active:
-                frame = np.array(sct.grab(self.capture_zone))
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+                if self.awaiting_perfect_flash:
+                    perfect_frame = np.array(sct.grab(self.perfect_zone))
+                    perfect_gray = cv2.cvtColor(perfect_frame, cv2.COLOR_BGRA2GRAY)
+                    self._maybe_press_space_on_flash(perfect_gray)
+                    time.sleep(0.001)
+                    continue
 
-                combo = self.find_combo(gray)
+                arrows_frame = np.array(sct.grab(self.arrow_zone))
+                arrows_gray = cv2.cvtColor(arrows_frame, cv2.COLOR_BGRA2GRAY)
+
+                combo = self.find_combo(arrows_gray)
                 if not combo:
                     time.sleep(0.002)
                     continue
@@ -211,10 +291,15 @@ class SmartDancer:
                 combo_text = " ".join(item["direction"] for item in combo)
                 self._append_log(f"Комбинация: {combo_text}")
 
-                self.press_combo(combo)
-                self.wait_and_press_space(frame)
+                if self.auto_arrows_var.get():
+                    self.press_combo(combo)
 
-                time.sleep(0.005)
+                if self.auto_space_var.get():
+                    self._enter_wait_for_flash()
+                else:
+                    self.awaiting_perfect_flash = False
+
+                time.sleep(0.004)
 
 
 if __name__ == "__main__":
