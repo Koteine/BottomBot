@@ -1,234 +1,104 @@
-import ctypes
-import os
-import sys
 import threading
 import time
+import tkinter as tk
 from datetime import datetime
 
-import customtkinter as ctk
 import cv2
 import keyboard
 import mss
 import numpy as np
-import psutil
 
-# Hardcoded scan area
-SCAN_X = 450
-SCAN_Y = 690
-SCAN_W = 742
-SCAN_H = 65
-
-# Hardcoded perfect area
-PERF_X = 810
-PERF_Y = 715
-PERF_W = 20
-PERF_H = 20
-
-BRIGHTNESS_SPACE_THRESHOLD = 235
-ARROW_THRESHOLD = 0.70
-WHITE_PIXEL_THRESHOLD = 245
-HOLD_ARROW_SEC = 0.04
-BETWEEN_ARROWS_SEC = 0.01
-POST_SPACE_COOLDOWN_SEC = 1.5
-
-SCAN_MONITOR = {"left": SCAN_X, "top": SCAN_Y, "width": SCAN_W, "height": SCAN_H}
-PERF_MONITOR = {"left": PERF_X, "top": PERF_Y, "width": PERF_W, "height": PERF_H}
-
-KEY_MAP = {
-    "left": "left",
-    "down": "down",
-    "up": "up",
-    "right": "right",
-}
+SCAN_AREA = {"top": 690, "left": 450, "width": 742, "height": 65}
+PERFECT_ZONE = {"top": 715, "left": 810, "width": 20, "height": 20}
+THRESHOLD = 0.7
+PERFECT_BRIGHTNESS = 230
 
 
-def ensure_admin() -> None:
-    if os.name != "nt":
-        return
-    try:
-        if not ctypes.windll.shell32.IsUserAnAdmin():
-            sys.exit()
-    except Exception:
-        sys.exit()
+def load_templates() -> dict[str, np.ndarray]:
+    files = {"left": "assets/left.png", "down": "assets/down.png", "up": "assets/up.png", "right": "assets/right.png"}
+    out: dict[str, np.ndarray] = {}
+    for name, path in files.items():
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(path)
+        out[name] = img
+    return out
 
 
-def set_high_priority() -> None:
-    try:
-        process = psutil.Process(os.getpid())
-        if os.name == "nt":
-            process.nice(psutil.HIGH_PRIORITY_CLASS)
-        else:
-            process.nice(-10)
-    except Exception:
-        pass
-
-
-def load_arrow_templates(assets_dir: str) -> dict[str, np.ndarray]:
-    files = {
-        "left": "left.png",
-        "down": "down.png",
-        "up": "up.png",
-        "right": "right.png",
-    }
-    templates: dict[str, np.ndarray] = {}
-    for direction, filename in files.items():
-        template = cv2.imread(f"{assets_dir}/{filename}", cv2.IMREAD_GRAYSCALE)
-        if template is None:
-            raise FileNotFoundError(f"Не найден шаблон: {assets_dir}/{filename}")
-        _, binary = cv2.threshold(template, 200, 255, cv2.THRESH_BINARY)
-        templates[direction] = binary
-    return templates
-
-
-def group_matches(matches: list[tuple[int, int, int, int, str, float]]) -> list[tuple[int, int, int, int, str, float]]:
-    groups: list[list[tuple[int, int, int, int, str, float]]] = []
-    for candidate in sorted(matches, key=lambda item: item[5], reverse=True):
-        x, y, w, h, _direction, _score = candidate
-        cx = x + (w / 2)
-        cy = y + (h / 2)
-        merged = False
-
-        for group in groups:
-            gx, gy, gw, gh, _gdirection, _gscore = group[0]
-            gcx = gx + (gw / 2)
-            gcy = gy + (gh / 2)
-            if abs(cx - gcx) <= max(12, int(max(w, gw) * 0.65)) and abs(cy - gcy) <= max(10, int(max(h, gh) * 0.65)):
-                group.append(candidate)
-                merged = True
-                break
-
-        if not merged:
-            groups.append([candidate])
-
-    unique = [max(group, key=lambda item: item[5]) for group in groups]
-    return sorted(unique, key=lambda item: item[0])
-
-
-def detect_arrows(gray_frame: np.ndarray, templates: dict[str, np.ndarray]) -> list[str]:
-    if not np.any(gray_frame >= WHITE_PIXEL_THRESHOLD):
-        return []
-
-    _, binary = cv2.threshold(gray_frame, 200, 255, cv2.THRESH_BINARY)
-    raw_matches: list[tuple[int, int, int, int, str, float]] = []
-
+def detect_arrows(gray: np.ndarray, templates: dict[str, np.ndarray]) -> list[str]:
+    hits = []
     for direction, template in templates.items():
-        h, w = template.shape[:2]
-        result = cv2.matchTemplate(binary, template, cv2.TM_CCOEFF_NORMED)
-        ys, xs = np.where(result >= ARROW_THRESHOLD)
+        result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+        ys, xs = np.where(result >= THRESHOLD)
         for y, x in zip(ys, xs):
-            raw_matches.append((int(x), int(y), int(w), int(h), direction, float(result[y, x])))
-
-    if not raw_matches:
-        return []
-
-    return [item[4] for item in group_matches(raw_matches)]
-
-
-def send_chain(arrows: list[str]) -> None:
-    for direction in arrows:
-        key = KEY_MAP.get(direction)
-        if key is None:
-            continue
-        keyboard.press(key)
-        time.sleep(HOLD_ARROW_SEC)
-        keyboard.release(key)
-        time.sleep(BETWEEN_ARROWS_SEC)
+            hits.append((int(x), direction, float(result[y, x])))
+    uniq = {}
+    for x, direction, score in sorted(hits, key=lambda i: i[2], reverse=True):
+        bucket = x // 8
+        if bucket not in uniq:
+            uniq[bucket] = (x, direction)
+    return [d for x, d in sorted(uniq.values(), key=lambda i: i[0])]
 
 
-class DanceBot:
-    def __init__(self, logger) -> None:
-        self.log = logger
-        self.is_active = False
-        self._stop_event = threading.Event()
-        self._worker: threading.Thread | None = None
-        self.templates = load_arrow_templates("assets")
+class Bot:
+    def __init__(self, log):
+        self.log = log
+        self.run_flag = False
+        self.templates = load_templates()
 
-    def start(self) -> None:
-        if self.is_active:
+    def start(self):
+        if self.run_flag:
             return
-        self.is_active = True
-        self._stop_event.clear()
-        self._worker = threading.Thread(target=self._loop, daemon=True)
-        self._worker.start()
+        self.run_flag = True
+        threading.Thread(target=self.loop, daemon=True).start()
 
-    def stop(self) -> None:
-        if not self.is_active:
-            return
-        self.is_active = False
-        self._stop_event.set()
-        if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=1.0)
-        self._worker = None
+    def stop(self):
+        self.run_flag = False
 
-    def _loop(self) -> None:
+    def loop(self):
         with mss.mss() as sct:
-            while self.is_active and not self._stop_event.is_set():
-                frame = np.array(sct.grab(SCAN_MONITOR))
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-                arrows = detect_arrows(gray, self.templates)
-                if not arrows:
+            while self.run_flag:
+                gray = cv2.cvtColor(np.array(sct.grab(SCAN_AREA)), cv2.COLOR_BGRA2GRAY)
+                chain = detect_arrows(gray, self.templates)
+                if not chain:
                     continue
-
-                send_chain(arrows)
-                chain = " ".join(arrow.upper() for arrow in arrows)
-                self.log(f"Ввел: {chain}")
-
-                while self.is_active and not self._stop_event.is_set():
-                    perf_frame = np.array(sct.grab(PERF_MONITOR))
-                    perf_gray = cv2.cvtColor(perf_frame, cv2.COLOR_BGRA2GRAY)
-                    brightness = int(np.mean(perf_gray))
-                    if brightness >= BRIGHTNESS_SPACE_THRESHOLD:
-                        keyboard.send("space")
-                        self.log(f"Удар: {brightness}")
-                        time.sleep(POST_SPACE_COOLDOWN_SEC)
+                for key in chain:
+                    keyboard.press_and_release(key)
+                self.log("Стрелки: " + " ".join(chain))
+                while self.run_flag:
+                    if np.mean(cv2.cvtColor(np.array(sct.grab(PERFECT_ZONE)), cv2.COLOR_BGRA2GRAY)) > PERFECT_BRIGHTNESS:
+                        keyboard.press_and_release("space")
+                        self.log("SPACE")
                         break
 
 
-class BotUI:
-    def __init__(self) -> None:
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
-
-        self.root = ctk.CTk()
+class UI:
+    def __init__(self):
+        self.root = tk.Tk()
         self.root.title("BottomBot")
-        self.root.geometry("360x240")
-        self.root.minsize(360, 240)
-        self.root.resizable(False, False)
-        self.root.attributes("-topmost", True)
+        self.root.geometry("420x260")
+        self.bot = Bot(self.log)
 
-        self.bot = DanceBot(self.append_log)
+        self.btn = tk.Button(self.root, text="СТАРТ", command=self.toggle, font=("Arial", 12, "bold"))
+        self.btn.pack(fill="x", padx=8, pady=8)
 
-        self.start_btn = ctk.CTkButton(self.root, text="ЗАПУСТИТЬ ТАНЕЦ", command=self.toggle)
-        self.start_btn.pack(fill="x", padx=10, pady=(10, 8))
+        self.box = tk.Text(self.root, height=12)
+        self.box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        self.log_box = ctk.CTkTextbox(self.root, width=340, height=180)
-        self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self.log_box.configure(state="disabled")
+    def log(self, text: str):
+        line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {text}\n"
+        self.root.after(0, lambda: (self.box.insert("end", line), self.box.see("end")))
 
-    def append_log(self, message: str) -> None:
-        line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {message}\n"
-
-        def write() -> None:
-            self.log_box.configure(state="normal")
-            self.log_box.insert("end", line)
-            self.log_box.see("end")
-            self.log_box.configure(state="disabled")
-
-        self.root.after(0, write)
-
-    def toggle(self) -> None:
-        if self.bot.is_active:
+    def toggle(self):
+        if self.bot.run_flag:
             self.bot.stop()
-            self.start_btn.configure(text="ЗАПУСТИТЬ ТАНЕЦ")
+            self.btn.config(text="СТАРТ")
+            self.log("Остановлено")
         else:
             self.bot.start()
-            self.start_btn.configure(text="ОСТАНОВИТЬ ТАНЕЦ")
-
-    def run(self) -> None:
-        self.root.mainloop()
+            self.btn.config(text="СТОП")
+            self.log("Запущено")
 
 
 if __name__ == "__main__":
-    ensure_admin()
-    set_high_priority()
-    BotUI().run()
+    UI().root.mainloop()
