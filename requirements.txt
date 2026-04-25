@@ -1,17 +1,8 @@
-diff --git a/requirements.txt b/requirements.txt
-index a07b86123232eb3d6bb30499526b9dcc363c000d..7077e85423d246366d14f5a7bcbc427b9bab564b 100644
---- a/requirements.txt
-+++ b/requirements.txt
-@@ -1,5 +1,7 @@
--PySide6>=6.6
--opencv-python>=4.9
--numpy>=1.26
--mss>=9.0
--pynput>=1.7
-+opencv-python
-+numpy
-+mss
-+pyautogui
-+customtkinter
-+pillow
-+keyboard
+opencv-python
+numpy
+mss
+pyautogui
+customtkinter
+pillow
+keyboard
+pydirectinput
