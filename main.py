@@ -14,11 +14,13 @@ from pynput.keyboard import Controller, Key
 
 CONFIG_PATH = Path("overlay_position.json")
 DEFAULT_REGION = {"x": 450, "y": 760, "width": 1100, "height": 120}
-DEFAULT_PERFECT_REGION = {"x": 980, "y": 740, "width": 40, "height": 40}
+DEFAULT_PERFECT_REGION = {"x": 980, "y": 740, "width": 10, "height": 10}
 
 ARROW_THRESHOLD = 0.7
-PRESS_HOLD_SEC = 0.04
-BETWEEN_ARROWS_SEC = 0.02
+PRESS_HOLD_SEC = 0.01
+BETWEEN_ARROWS_SEC = 0.012
+PERFECT_FLASH_THRESHOLD = 230
+PERFECT_MONITOR_SIZE = 10
 
 RATING_PRESETS = {
     "Идеал": {"perfect_brightness": 235},
@@ -133,7 +135,7 @@ class BotBackend:
         self.auto_space_enabled = True
         self.game_window_title = ""
         self.template_threshold = ARROW_THRESHOLD
-        self.perfect_brightness_threshold = 225
+        self.perfect_brightness_threshold = PERFECT_FLASH_THRESHOLD
 
         self.is_active = False
 
@@ -217,25 +219,35 @@ class BotBackend:
         self.template_threshold = max(0.60, min(0.99, float(precision_threshold)))
 
         preset = RATING_PRESETS.get(rating_mode, RATING_PRESETS["Круто"])
-        self.perfect_brightness_threshold = preset["perfect_brightness"]
+        self.perfect_brightness_threshold = max(PERFECT_FLASH_THRESHOLD, preset["perfect_brightness"])
 
     @staticmethod
-    def _dedupe_matches(
-        matches: list[tuple[int, int, int, int, str, float]],
-        min_dx: int = 10,
-        min_dy: int = 10,
-    ) -> list[tuple[int, int, int, int, str, float]]:
-        selected: list[tuple[int, int, int, int, str, float]] = []
-        for match in sorted(matches, key=lambda item: item[5], reverse=True):
-            x, y, w, h, direction, score = match
-            too_close = False
-            for sx, sy, *_ in selected:
-                if abs(x - sx) < min_dx and abs(y - sy) < min_dy:
-                    too_close = True
+    def _group_matches(matches: list[tuple[int, int, int, int, str, float]]) -> list[tuple[int, int, int, int, str, float]]:
+        groups: list[list[tuple[int, int, int, int, str, float]]] = []
+        sorted_by_score = sorted(matches, key=lambda item: item[5], reverse=True)
+
+        for candidate in sorted_by_score:
+            x, y, w, h, _direction, _score = candidate
+            cx = x + (w / 2)
+            cy = y + (h / 2)
+            merged = False
+
+            for group in groups:
+                gx, gy, gw, gh, _gdirection, _gscore = group[0]
+                gcx = gx + (gw / 2)
+                gcy = gy + (gh / 2)
+                near_x = abs(cx - gcx) <= max(12, int(max(w, gw) * 0.65))
+                near_y = abs(cy - gcy) <= max(10, int(max(h, gh) * 0.65))
+                if near_x and near_y:
+                    group.append(candidate)
+                    merged = True
                     break
-            if not too_close:
-                selected.append((x, y, w, h, direction, score))
-        return selected
+
+            if not merged:
+                groups.append([candidate])
+
+        unique = [max(group, key=lambda item: item[5]) for group in groups]
+        return sorted(unique, key=lambda item: item[0])
 
     def _scan_arrows(self, gray_frame: np.ndarray) -> tuple[list[str], list[tuple[int, int, int, int, str, float]]]:
         binary = self._to_binary(gray_frame)
@@ -252,35 +264,40 @@ class BotBackend:
         if not raw_matches:
             return [], []
 
-        deduped = self._dedupe_matches(raw_matches)
-        ordered = sorted(deduped, key=lambda item: item[0])
+        ordered = self._group_matches(raw_matches)
         arrows = [item[4] for item in ordered]
         return arrows, ordered
 
     def _wait_perfect_and_space(self, sct: mss.mss) -> bool:
         perfect = self.get_perfect_region()
+        center_x = perfect.left + (perfect.width // 2)
+        center_y = perfect.top + (perfect.height // 2)
+        size = PERFECT_MONITOR_SIZE
         monitor = {
-            "left": perfect.left,
-            "top": perfect.top,
-            "width": perfect.width,
-            "height": perfect.height,
+            "left": center_x - (size // 2),
+            "top": center_y - (size // 2),
+            "width": size,
+            "height": size,
         }
 
         timeout_sec = 1.8
         started = time.perf_counter()
+        last_debug_log = 0.0
 
         while self.is_active and not self._stop_event.is_set() and (time.perf_counter() - started) <= timeout_sec:
             frame = np.array(sct.grab(monitor))
             gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-            brightness = int(np.max(gray))
+            brightness = int(np.mean(gray))
+            now = time.perf_counter()
+            if (now - last_debug_log) >= 0.08:
+                self.log(f"[Debug] Текущая яркость Perfect: {brightness}")
+                last_debug_log = now
             if brightness >= self.perfect_brightness_threshold:
                 KEYBOARD.press(Key.space)
-                time.sleep(PRESS_HOLD_SEC)
                 KEYBOARD.release(Key.space)
                 self.log(f"[SmartMode] SPACE в Perfect-зоне, яркость={brightness}")
                 self.set_action(f"SPACE ({brightness})")
                 return True
-            time.sleep(0.001)
         return False
 
     def run_notepad_input_test(self) -> None:
@@ -359,7 +376,7 @@ class BotBackend:
 
                 if self.auto_keys_enabled:
                     execute_sequence(arrows)
-                    self.log(f"[SmartMode] Стрелки: {' '.join(a.upper() for a in arrows)}")
+                    self.log(f"[SmartMode] Нажимаю: {', '.join(a.upper() for a in arrows)}")
                     self.set_action("Комбо: " + ", ".join(k.upper() for k in arrows))
 
                 if self.auto_space_enabled:
