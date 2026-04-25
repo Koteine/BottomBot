@@ -1,8 +1,6 @@
 import json
-import random
 import threading
 import time
-import ctypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,110 +10,28 @@ import customtkinter as ctk
 import cv2
 import mss
 import numpy as np
+from pynput.keyboard import Controller, Key
 
 CONFIG_PATH = Path("overlay_position.json")
 DEFAULT_REGION = {"x": 450, "y": 760, "width": 1100, "height": 120}
-TRIGGER_SLICE_WIDTH = 180
+DEFAULT_PERFECT_REGION = {"x": 980, "y": 740, "width": 40, "height": 40}
 
-# DirectInput-compatible scancode table (DIK_* values).
-SCANCODE_MAP = {
-    "up": {"dik": 0xC8, "scan": 0x48, "extended": True},
-    "down": {"dik": 0xD0, "scan": 0x50, "extended": True},
-    "left": {"dik": 0xCB, "scan": 0x4B, "extended": True},
-    "right": {"dik": 0xCD, "scan": 0x4D, "extended": True},
-    "space": {"dik": 0x39, "scan": 0x39, "extended": False},
-}
-
-TEXT_SCANCODE_MAP = {
-    "U": 0x16,
-    "P": 0x19,
-    "D": 0x20,
-    "O": 0x18,
-    "W": 0x11,
-    "N": 0x31,
-    "L": 0x26,
-    "E": 0x12,
-    "F": 0x21,
-    "T": 0x14,
-    "R": 0x13,
-    "I": 0x17,
-    "G": 0x22,
-    "H": 0x23,
-    " ": 0x39,
-}
-
-SHIFT_SCANCODE = 0x2A
-
-INPUT_KEYBOARD = 1
-KEYEVENTF_EXTENDEDKEY = 0x0001
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_SCANCODE = 0x0008
-
-
-class KeybdInput(ctypes.Structure):
-    _fields_ = [
-        ("wVk", ctypes.c_ushort),
-        ("wScan", ctypes.c_ushort),
-        ("dwFlags", ctypes.c_ulong),
-        ("time", ctypes.c_ulong),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
-
-
-class MouseInput(ctypes.Structure):
-    _fields_ = [
-        ("dx", ctypes.c_long),
-        ("dy", ctypes.c_long),
-        ("mouseData", ctypes.c_ulong),
-        ("dwFlags", ctypes.c_ulong),
-        ("time", ctypes.c_ulong),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
-
-
-class HardwareInput(ctypes.Structure):
-    _fields_ = [
-        ("uMsg", ctypes.c_ulong),
-        ("wParamL", ctypes.c_short),
-        ("wParamH", ctypes.c_ushort),
-    ]
-
-
-class Input_I(ctypes.Union):
-    _fields_ = [
-        ("ki", KeybdInput),
-        ("mi", MouseInput),
-        ("hi", HardwareInput),
-    ]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_ulong), ("ii", Input_I)]
-
-
-def send_scancode(scan_code: int, key_up: bool = False, extended: bool = False) -> None:
-    flags = KEYEVENTF_SCANCODE
-    if key_up:
-        flags |= KEYEVENTF_KEYUP
-    if extended:
-        flags |= KEYEVENTF_EXTENDEDKEY
-
-    extra = ctypes.c_ulong(0)
-    ii = Input_I()
-    ii.ki = KeybdInput(0, scan_code, flags, 0, ctypes.pointer(extra))
-    payload = INPUT(INPUT_KEYBOARD, ii)
-    ctypes.windll.user32.SendInput(1, ctypes.byref(payload), ctypes.sizeof(INPUT))
-
-
-def tap_scancode(scan_code: int, min_hold: float = 0.04, max_hold: float = 0.07, extended: bool = False) -> None:
-    send_scancode(scan_code, key_up=False, extended=extended)
-    time.sleep(random.uniform(min_hold, max_hold))
-    send_scancode(scan_code, key_up=True, extended=extended)
+ARROW_THRESHOLD = 0.7
+PRESS_HOLD_SEC = 0.04
+BETWEEN_ARROWS_SEC = 0.02
 
 RATING_PRESETS = {
     "Идеал": {"perfect_brightness": 235},
     "Круто": {"perfect_brightness": 225},
     "Хорошо": {"perfect_brightness": 210},
+}
+
+KEYBOARD = Controller()
+ARROW_KEYS = {
+    "up": Key.up,
+    "down": Key.down,
+    "left": Key.left,
+    "right": Key.right,
 }
 
 
@@ -125,6 +41,19 @@ class CaptureRegion:
     top: int
     width: int
     height: int
+
+
+def execute_sequence(arrows: list[str]) -> None:
+    """Классическая SmartDancer-подача: мгновенный проход очереди стрелок."""
+    for idx, arrow in enumerate(arrows):
+        key = ARROW_KEYS.get(arrow)
+        if key is None:
+            continue
+        KEYBOARD.press(key)
+        time.sleep(PRESS_HOLD_SEC)
+        KEYBOARD.release(key)
+        if idx < len(arrows) - 1:
+            time.sleep(BETWEEN_ARROWS_SEC)
 
 
 class OverlayWindow:
@@ -141,13 +70,11 @@ class OverlayWindow:
         self.window.attributes("-topmost", True)
         self.window.configure(fg_color="grey")
 
-        # Для Windows: серый цвет становится прозрачным.
         try:
             self.window.attributes("-transparentcolor", "grey")
         except Exception:
             pass
 
-        # Не перехватывать фокус/мышь — клик проходит в игру.
         try:
             self.window.attributes("-disabled", True)
         except Exception:
@@ -204,12 +131,10 @@ class BotBackend:
 
         self.auto_keys_enabled = True
         self.auto_space_enabled = True
-        self.game_window_title = "FreeStreet"
-        self.template_threshold = 0.82
+        self.game_window_title = ""
+        self.template_threshold = ARROW_THRESHOLD
         self.perfect_brightness_threshold = 225
-        self.perfect_offset_ms = 0
-        self.scan_cooldown_sec = 0.01
-        self.post_combo_sleep_sec = 2.0
+
         self.is_active = False
 
         self._region_lock = threading.Lock()
@@ -218,6 +143,12 @@ class BotBackend:
             top=DEFAULT_REGION["y"],
             width=DEFAULT_REGION["width"],
             height=DEFAULT_REGION["height"],
+        )
+        self._perfect_region = CaptureRegion(
+            left=DEFAULT_PERFECT_REGION["x"],
+            top=DEFAULT_PERFECT_REGION["y"],
+            width=DEFAULT_PERFECT_REGION["width"],
+            height=DEFAULT_PERFECT_REGION["height"],
         )
 
         self._worker: threading.Thread | None = None
@@ -255,9 +186,22 @@ class BotBackend:
                 height=max(20, int(height)),
             )
 
+    def set_perfect_region(self, left: int, top: int, width: int, height: int) -> None:
+        with self._region_lock:
+            self._perfect_region = CaptureRegion(
+                left=int(left),
+                top=int(top),
+                width=max(5, int(width)),
+                height=max(5, int(height)),
+            )
+
     def get_capture_region(self) -> CaptureRegion:
         with self._region_lock:
             return self._region
+
+    def get_perfect_region(self) -> CaptureRegion:
+        with self._region_lock:
+            return self._perfect_region
 
     def update_settings(
         self,
@@ -266,99 +210,88 @@ class BotBackend:
         game_window_title: str,
         rating_mode: str,
         precision_threshold: float,
-        perfect_offset_ms: int,
     ) -> None:
         self.auto_keys_enabled = auto_keys
         self.auto_space_enabled = auto_space
-        self.game_window_title = game_window_title.strip() or "FreeStreet"
-        self.template_threshold = max(0.75, min(0.99, float(precision_threshold)))
-        self.perfect_offset_ms = max(-20, min(20, int(perfect_offset_ms)))
+        self.game_window_title = game_window_title.strip()
+        self.template_threshold = max(0.60, min(0.99, float(precision_threshold)))
 
         preset = RATING_PRESETS.get(rating_mode, RATING_PRESETS["Круто"])
         self.perfect_brightness_threshold = preset["perfect_brightness"]
 
-    def _detect_keys(self, binary_frame: np.ndarray) -> tuple[list[str], list[tuple[int, int, int, int, str, float]]]:
-        contours, _hier = cv2.findContours(binary_frame, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        detections: list[tuple[str, int]] = []
-        debug_boxes: list[tuple[int, int, int, int, str, float]] = []
-
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            area = w * h
-            if area < 120 or w < 10 or h < 10:
-                continue
-
-            roi = binary_frame[y : y + h, x : x + w]
-            best_direction = ""
-            best_score = -1.0
-
-            for direction, template in self.templates.items():
-                resized_template = cv2.resize(template, (w, h), interpolation=cv2.INTER_NEAREST)
-                res = cv2.matchTemplate(roi, resized_template, cv2.TM_CCOEFF_NORMED)
-                score = float(np.max(res))
-                if score > best_score:
-                    best_score = score
-                    best_direction = direction
-
-            if best_score >= self.template_threshold:
-                center_x = int(x + (w / 2))
-                detections.append((best_direction, center_x))
-                debug_boxes.append((x, y, w, h, best_direction, best_score))
-
-        detections.sort(key=lambda item: item[1])
-        return [direction for direction, _x in detections], debug_boxes
-
-    def _press_combo(self, keys: list[str]) -> None:
-        for key in keys:
-            config = SCANCODE_MAP.get(key)
-            if config is None:
-                continue
-            tap_scancode(config["scan"], min_hold=0.04, max_hold=0.07, extended=config["extended"])
-            self.log(f"[DirectX] Нажата {key.upper()}.")
-            time.sleep(random.uniform(0.02, 0.05))
-
     @staticmethod
-    def _get_foreground_title() -> str:
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return ""
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
-            return ""
-        title_buffer = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, title_buffer, length + 1)
-        return title_buffer.value
+    def _dedupe_matches(
+        matches: list[tuple[int, int, int, int, str, float]],
+        min_dx: int = 10,
+        min_dy: int = 10,
+    ) -> list[tuple[int, int, int, int, str, float]]:
+        selected: list[tuple[int, int, int, int, str, float]] = []
+        for match in sorted(matches, key=lambda item: item[5], reverse=True):
+            x, y, w, h, direction, score = match
+            too_close = False
+            for sx, sy, *_ in selected:
+                if abs(x - sx) < min_dx and abs(y - sy) < min_dy:
+                    too_close = True
+                    break
+            if not too_close:
+                selected.append((x, y, w, h, direction, score))
+        return selected
 
-    def _is_game_window_focused(self) -> bool:
-        title = self._get_foreground_title().lower()
-        return self.game_window_title.lower() in title
+    def _scan_arrows(self, gray_frame: np.ndarray) -> tuple[list[str], list[tuple[int, int, int, int, str, float]]]:
+        binary = self._to_binary(gray_frame)
+        raw_matches: list[tuple[int, int, int, int, str, float]] = []
+
+        for direction, template in self.templates.items():
+            h, w = template.shape[:2]
+            result = cv2.matchTemplate(binary, template, cv2.TM_CCOEFF_NORMED)
+            ys, xs = np.where(result >= self.template_threshold)
+            for y, x in zip(ys, xs):
+                score = float(result[y, x])
+                raw_matches.append((int(x), int(y), int(w), int(h), direction, score))
+
+        if not raw_matches:
+            return [], []
+
+        deduped = self._dedupe_matches(raw_matches)
+        ordered = sorted(deduped, key=lambda item: item[0])
+        arrows = [item[4] for item in ordered]
+        return arrows, ordered
+
+    def _wait_perfect_and_space(self, sct: mss.mss) -> bool:
+        perfect = self.get_perfect_region()
+        monitor = {
+            "left": perfect.left,
+            "top": perfect.top,
+            "width": perfect.width,
+            "height": perfect.height,
+        }
+
+        timeout_sec = 1.8
+        started = time.perf_counter()
+
+        while self.is_active and not self._stop_event.is_set() and (time.perf_counter() - started) <= timeout_sec:
+            frame = np.array(sct.grab(monitor))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+            brightness = int(np.max(gray))
+            if brightness >= self.perfect_brightness_threshold:
+                KEYBOARD.press(Key.space)
+                time.sleep(PRESS_HOLD_SEC)
+                KEYBOARD.release(Key.space)
+                self.log(f"[SmartMode] SPACE в Perfect-зоне, яркость={brightness}")
+                self.set_action(f"SPACE ({brightness})")
+                return True
+            time.sleep(0.001)
+        return False
 
     def run_notepad_input_test(self) -> None:
-        self.log("ТЕСТ В БЛОКНОТЕ: через 3 секунды отправлю 'UP DOWN LEFT RIGHT' в активное поле...")
+        self.log("ТЕСТ В БЛОКНОТЕ: через 3 секунды отправлю 'UP DOWN LEFT RIGHT'...")
 
         def worker() -> None:
             time.sleep(3.0)
-            self._type_text("UP DOWN LEFT RIGHT")
+            KEYBOARD.type("UP DOWN LEFT RIGHT")
             self.log("ТЕСТ В БЛОКНОТЕ завершен.")
 
         threading.Thread(target=worker, daemon=True).start()
-
-    @staticmethod
-    def _type_text(text: str) -> None:
-        for char in text:
-            scancode = TEXT_SCANCODE_MAP.get(char)
-            if scancode is None:
-                continue
-
-            if char != " ":
-                send_scancode(SHIFT_SCANCODE, key_up=False)
-                tap_scancode(scancode, min_hold=0.04, max_hold=0.06)
-                send_scancode(SHIFT_SCANCODE, key_up=True)
-            else:
-                tap_scancode(scancode, min_hold=0.04, max_hold=0.06)
-
-            time.sleep(random.uniform(0.03, 0.07))
 
     @staticmethod
     def _save_debug_match(frame_bgr: np.ndarray, matches: list[tuple[int, int, int, int, str, float]]) -> None:
@@ -377,25 +310,6 @@ class BotBackend:
             )
         cv2.imwrite("debug_match.png", debug)
 
-    def _wait_perfect_and_space(self, sct: mss.mss, region: dict) -> bool:
-        timeout_sec = 1.8
-        started = time.perf_counter()
-        while self.is_active and not self._stop_event.is_set() and (time.perf_counter() - started) <= timeout_sec:
-            frame = np.array(sct.grab(region))
-            bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            brightness = int(np.max(bgr))
-            if brightness >= self.perfect_brightness_threshold:
-                jitter_ms = random.randint(-10, 10)
-                total_offset_ms = self.perfect_offset_ms + jitter_ms
-                if total_offset_ms > 0:
-                    time.sleep(total_offset_ms / 1000.0)
-                tap_scancode(SCANCODE_MAP["space"]["scan"], min_hold=0.04, max_hold=0.07)
-                self.log(f"[DirectX] Нажата SPACE. Perfect={brightness}, offset={total_offset_ms}ms")
-                self.set_action(f"SPACE ({brightness})")
-                return True
-            time.sleep(0.001)
-        return False
-
     def start(self) -> None:
         if self.is_active:
             return
@@ -405,9 +319,7 @@ class BotBackend:
         self._worker.start()
         self.set_status("Статус: Запущен")
         self.set_action("Сканирование")
-        tap_scancode(SCANCODE_MAP["space"]["scan"], min_hold=0.04, max_hold=0.07)
-        self.log("Бот запущен")
-        self.log("Тест управления: SPACE прожат после нажатия СТАРТ")
+        self.log("[SmartMode] Очередь готова, жду стрелки...")
 
     def stop(self) -> None:
         if not self.is_active:
@@ -415,7 +327,7 @@ class BotBackend:
         self.is_active = False
         self._stop_event.set()
         if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=1.2)
+            self._worker.join(timeout=1.0)
         self._worker = None
         self.set_status("Статус: Остановлен")
         self.set_action("Ожидание")
@@ -423,19 +335,7 @@ class BotBackend:
 
     def _worker_loop(self) -> None:
         with mss.mss() as sct:
-            last_scan_log_t = 0.0
-            last_scan_region: tuple[int, int, int, int] | None = None
-            last_focus_log_t = 0.0
-
             while self.is_active and not self._stop_event.is_set():
-                if not self._is_game_window_focused():
-                    now = time.perf_counter()
-                    if now - last_focus_log_t >= 1.0:
-                        self.log("Ожидание фокуса игры....")
-                        last_focus_log_t = now
-                    time.sleep(0.05)
-                    continue
-
                 region = self.get_capture_region()
                 monitor = {
                     "left": region.left,
@@ -444,39 +344,29 @@ class BotBackend:
                     "height": region.height,
                 }
 
-                now = time.perf_counter()
-                region_tuple = (region.left, region.top, region.width, region.height)
-                if now - last_scan_log_t >= 1.0 or region_tuple != last_scan_region:
-                    self.log(f"Сканирую область [{region.left}, {region.top}, {region.width}, {region.height}]...")
-                    last_scan_log_t = now
-                    last_scan_region = region_tuple
+                frame = np.array(sct.grab(monitor))
+                bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
 
-                full = np.array(sct.grab(monitor))
-                full_bgr = cv2.cvtColor(full, cv2.COLOR_BGRA2BGR)
-                full_gray = cv2.cvtColor(full, cv2.COLOR_BGRA2GRAY)
-                full_binary = self._to_binary(full_gray)
-
-                keys, matches = self._detect_keys(full_binary)
-                if not keys:
+                arrows, matches = self._scan_arrows(gray)
+                if not arrows:
                     self.vision_feedback(False)
-                    time.sleep(self.scan_cooldown_sec)
+                    time.sleep(0.01)
                     continue
 
-                self._save_debug_match(full_bgr, matches)
-                for _x, _y, _w, _h, direction, score in matches:
-                    self.log(f"Найдена стрелка: {direction} с точностью {score:.3f}")
-
                 self.vision_feedback(True)
+                self._save_debug_match(bgr, matches)
 
                 if self.auto_keys_enabled:
-                    self._press_combo(keys)
-                    self.log(f"Комбо: {keys}")
-                    self.set_action("Комбо: " + ", ".join(k.upper() for k in keys))
+                    execute_sequence(arrows)
+                    self.log(f"[SmartMode] Стрелки: {' '.join(a.upper() for a in arrows)}")
+                    self.set_action("Комбо: " + ", ".join(k.upper() for k in arrows))
 
                 if self.auto_space_enabled:
-                    self._wait_perfect_and_space(sct, monitor)
+                    self.log("[SmartMode] Очередь введена, жду Perfect...")
+                    self._wait_perfect_and_space(sct)
 
-                time.sleep(self.post_combo_sleep_sec)
+                time.sleep(0.02)
 
 
 class AristocratUI:
@@ -486,24 +376,28 @@ class AristocratUI:
 
         self.root = ctk.CTk()
         self.root.title("BottomBot DX")
-        self.root.geometry("460x420")
-        self.root.minsize(430, 390)
+        self.root.geometry("540x520")
+        self.root.minsize(500, 470)
         self.root.resizable(True, True)
         self.root.configure(fg_color="#11081f")
         self.root.attributes("-topmost", True)
 
         self.auto_keys_var = ctk.BooleanVar(value=True)
         self.auto_space_var = ctk.BooleanVar(value=True)
-        self.game_window_title_var = ctk.StringVar(value="FreeStreet")
+        self.game_window_title_var = ctk.StringVar(value="")
         self.rating_mode_var = ctk.StringVar(value="Круто")
-        self.precision_threshold_var = ctk.DoubleVar(value=0.82)
-        self.perfect_offset_var = ctk.IntVar(value=0)
+        self.precision_threshold_var = ctk.DoubleVar(value=0.70)
 
         saved = self._load_region_config()
         self.region_x_var = ctk.IntVar(value=saved["x"])
         self.region_y_var = ctk.IntVar(value=saved["y"])
         self.region_w_var = ctk.IntVar(value=saved["width"])
         self.region_h_var = ctk.IntVar(value=saved["height"])
+
+        self.perfect_x_var = ctk.IntVar(value=saved["perfect_x"])
+        self.perfect_y_var = ctk.IntVar(value=saved["perfect_y"])
+        self.perfect_w_var = ctk.IntVar(value=saved["perfect_width"])
+        self.perfect_h_var = ctk.IntVar(value=saved["perfect_height"])
 
         self.overlay = OverlayWindow(self.root)
         self.backend = BotBackend(self.append_log, self.set_status, self.set_last_action, self.on_vision_feedback)
@@ -512,7 +406,7 @@ class AristocratUI:
         self._bind_region_traces()
         self.game_window_title_var.trace_add("write", lambda *_: self._sync_backend())
         self._sync_backend()
-        self._apply_region_to_overlay_and_backend()
+        self._apply_regions_to_backend()
 
     def _build_layout(self) -> None:
         self.root.grid_rowconfigure(2, weight=1)
@@ -563,7 +457,7 @@ class AristocratUI:
 
         game_row = ctk.CTkFrame(frame, fg_color="transparent")
         game_row.pack(fill="x", padx=14, pady=6)
-        ctk.CTkLabel(game_row, text="Окно игры").pack(side="left")
+        ctk.CTkLabel(game_row, text="Фильтр окна (опц.)").pack(side="left")
         ctk.CTkEntry(game_row, textvariable=self.game_window_title_var).pack(side="right", fill="x", expand=True, padx=(10, 0))
 
         mode_row = ctk.CTkFrame(frame, fg_color="transparent")
@@ -578,41 +472,31 @@ class AristocratUI:
 
         precision_row = ctk.CTkFrame(frame, fg_color="transparent")
         precision_row.pack(fill="x", padx=14, pady=6)
-        ctk.CTkLabel(precision_row, text="Точность").pack(side="left")
+        ctk.CTkLabel(precision_row, text="Порог matchTemplate").pack(side="left")
         ctk.CTkSlider(
             precision_row,
-            from_=0.75,
-            to=0.99,
-            number_of_steps=24,
+            from_=0.60,
+            to=0.95,
+            number_of_steps=35,
             variable=self.precision_threshold_var,
             command=lambda _v: self._sync_backend(),
         ).pack(side="right", fill="x", expand=True, padx=(10, 0))
 
-        offset_row = ctk.CTkFrame(frame, fg_color="transparent")
-        offset_row.pack(fill="x", padx=14, pady=6)
-        ctk.CTkLabel(offset_row, text="Смещение Perfect (мс)").pack(side="left")
-        ctk.CTkSlider(
-            offset_row,
-            from_=-20,
-            to=20,
-            number_of_steps=40,
-            variable=self.perfect_offset_var,
-            command=lambda _v: self._sync_backend(),
-        ).pack(side="right", fill="x", expand=True, padx=(10, 0))
-
-        ctk.CTkLabel(
-            frame,
-            text="Калибровка зоны захвата (рамка двигается мгновенно):",
-            text_color="#cdb6ff",
-        ).pack(anchor="w", padx=14, pady=(10, 6))
-
+        ctk.CTkLabel(frame, text="Синяя рамка: зона стрелок", text_color="#cdb6ff").pack(anchor="w", padx=14, pady=(10, 6))
         sliders = ctk.CTkFrame(frame, fg_color="transparent")
         sliders.pack(fill="x", padx=14, pady=(0, 8))
-
         self._add_region_control(sliders, "X", self.region_x_var, 0, 0, 5000)
         self._add_region_control(sliders, "Y", self.region_y_var, 1, 0, 3000)
         self._add_region_control(sliders, "Ширина", self.region_w_var, 2, 20, 5000)
         self._add_region_control(sliders, "Высота", self.region_h_var, 3, 20, 3000)
+
+        ctk.CTkLabel(frame, text="Perfect-зона (маленький квадрат)", text_color="#cdb6ff").pack(anchor="w", padx=14, pady=(10, 6))
+        p_sliders = ctk.CTkFrame(frame, fg_color="transparent")
+        p_sliders.pack(fill="x", padx=14, pady=(0, 8))
+        self._add_region_control(p_sliders, "PX", self.perfect_x_var, 0, 0, 5000)
+        self._add_region_control(p_sliders, "PY", self.perfect_y_var, 1, 0, 3000)
+        self._add_region_control(p_sliders, "P-Шир", self.perfect_w_var, 2, 5, 300)
+        self._add_region_control(p_sliders, "P-Выс", self.perfect_h_var, 3, 5, 300)
 
     def _add_region_control(
         self,
@@ -651,13 +535,23 @@ class AristocratUI:
         self.log_box.configure(state="disabled")
 
     def _bind_region_traces(self) -> None:
-        for var in (self.region_x_var, self.region_y_var, self.region_w_var, self.region_h_var):
+        vars_to_bind = (
+            self.region_x_var,
+            self.region_y_var,
+            self.region_w_var,
+            self.region_h_var,
+            self.perfect_x_var,
+            self.perfect_y_var,
+            self.perfect_w_var,
+            self.perfect_h_var,
+        )
+        for var in vars_to_bind:
             var.trace_add("write", self._on_region_change)
 
     def _on_region_change(self, *_args) -> None:
-        self._apply_region_to_overlay_and_backend()
+        self._apply_regions_to_backend()
 
-    def _apply_region_to_overlay_and_backend(self) -> None:
+    def _apply_regions_to_backend(self) -> None:
         region = CaptureRegion(
             left=int(self.region_x_var.get()),
             top=int(self.region_y_var.get()),
@@ -668,6 +562,13 @@ class AristocratUI:
         screen_region = self.overlay.get_screen_region()
         self.backend.set_capture_region(screen_region.left, screen_region.top, screen_region.width, screen_region.height)
 
+        self.backend.set_perfect_region(
+            int(self.perfect_x_var.get()),
+            int(self.perfect_y_var.get()),
+            max(5, int(self.perfect_w_var.get())),
+            max(5, int(self.perfect_h_var.get())),
+        )
+
     def _sync_backend(self) -> None:
         self.backend.update_settings(
             auto_keys=bool(self.auto_keys_var.get()),
@@ -675,7 +576,6 @@ class AristocratUI:
             game_window_title=self.game_window_title_var.get(),
             rating_mode=self.rating_mode_var.get(),
             precision_threshold=float(self.precision_threshold_var.get()),
-            perfect_offset_ms=int(self.perfect_offset_var.get()),
         )
 
     def append_log(self, message: str) -> None:
@@ -708,23 +608,42 @@ class AristocratUI:
             "y": int(self.region_y_var.get()),
             "width": max(20, int(self.region_w_var.get())),
             "height": max(20, int(self.region_h_var.get())),
+            "perfect_x": int(self.perfect_x_var.get()),
+            "perfect_y": int(self.perfect_y_var.get()),
+            "perfect_width": max(5, int(self.perfect_w_var.get())),
+            "perfect_height": max(5, int(self.perfect_h_var.get())),
         }
         CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         self.append_log(f"Позиция сохранена: {data}")
 
     def _load_region_config(self) -> dict:
+        defaults = {
+            "x": DEFAULT_REGION["x"],
+            "y": DEFAULT_REGION["y"],
+            "width": DEFAULT_REGION["width"],
+            "height": DEFAULT_REGION["height"],
+            "perfect_x": DEFAULT_PERFECT_REGION["x"],
+            "perfect_y": DEFAULT_PERFECT_REGION["y"],
+            "perfect_width": DEFAULT_PERFECT_REGION["width"],
+            "perfect_height": DEFAULT_PERFECT_REGION["height"],
+        }
+
         if not CONFIG_PATH.exists():
-            return DEFAULT_REGION.copy()
+            return defaults
         try:
             raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             return {
-                "x": int(raw.get("x", DEFAULT_REGION["x"])),
-                "y": int(raw.get("y", DEFAULT_REGION["y"])),
-                "width": max(20, int(raw.get("width", DEFAULT_REGION["width"]))),
-                "height": max(20, int(raw.get("height", DEFAULT_REGION["height"]))),
+                "x": int(raw.get("x", defaults["x"])),
+                "y": int(raw.get("y", defaults["y"])),
+                "width": max(20, int(raw.get("width", defaults["width"]))),
+                "height": max(20, int(raw.get("height", defaults["height"]))),
+                "perfect_x": int(raw.get("perfect_x", defaults["perfect_x"])),
+                "perfect_y": int(raw.get("perfect_y", defaults["perfect_y"])),
+                "perfect_width": max(5, int(raw.get("perfect_width", defaults["perfect_width"]))),
+                "perfect_height": max(5, int(raw.get("perfect_height", defaults["perfect_height"]))),
             }
         except Exception:
-            return DEFAULT_REGION.copy()
+            return defaults
 
     def toggle_bot(self) -> None:
         if self.backend.is_active:
@@ -732,7 +651,7 @@ class AristocratUI:
             self.start_btn.configure(text="Запустить", fg_color="#5d2e8c")
         else:
             self._sync_backend()
-            self._apply_region_to_overlay_and_backend()
+            self._apply_regions_to_backend()
             self.backend.start()
             self.start_btn.configure(text="Остановить", fg_color="#8b1e3f")
 
