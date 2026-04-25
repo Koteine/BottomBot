@@ -2,6 +2,7 @@ import json
 import random
 import threading
 import time
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,11 +12,83 @@ import customtkinter as ctk
 import cv2
 import mss
 import numpy as np
-import pydirectinput
+import win32gui
 
 CONFIG_PATH = Path("overlay_position.json")
 DEFAULT_REGION = {"x": 450, "y": 760, "width": 1100, "height": 120}
 TRIGGER_SLICE_WIDTH = 180
+
+# DirectInput-compatible scancode table (DIK_* values).
+SCANCODE_MAP = {
+    "up": {"dik": 0xC8, "scan": 0x48, "extended": True},
+    "down": {"dik": 0xD0, "scan": 0x50, "extended": True},
+    "left": {"dik": 0xCB, "scan": 0x4B, "extended": True},
+    "right": {"dik": 0xCD, "scan": 0x4D, "extended": True},
+    "space": {"dik": 0x39, "scan": 0x39, "extended": False},
+}
+
+TEXT_SCANCODE_MAP = {
+    "U": 0x16,
+    "P": 0x19,
+    "D": 0x20,
+    "O": 0x18,
+    "W": 0x11,
+    "N": 0x31,
+    "L": 0x26,
+    "E": 0x12,
+    "F": 0x21,
+    "T": 0x14,
+    "R": 0x13,
+    "I": 0x17,
+    "G": 0x22,
+    "H": 0x23,
+    " ": 0x39,
+}
+
+SHIFT_SCANCODE = 0x2A
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
+GA_ROOT = 2
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("union", _INPUTUNION)]
+
+
+def send_scancode(scan_code: int, key_up: bool = False, extended: bool = False) -> None:
+    flags = KEYEVENTF_SCANCODE
+    if key_up:
+        flags |= KEYEVENTF_KEYUP
+    if extended:
+        flags |= KEYEVENTF_EXTENDEDKEY
+
+    extra = ctypes.c_ulong(0)
+    keyboard_input = KEYBDINPUT(0, scan_code, flags, 0, ctypes.pointer(extra))
+    payload = INPUT(INPUT_KEYBOARD, _INPUTUNION(ki=keyboard_input))
+    ctypes.windll.user32.SendInput(1, ctypes.byref(payload), ctypes.sizeof(INPUT))
+
+
+def tap_scancode(scan_code: int, min_hold: float = 0.04, max_hold: float = 0.07, extended: bool = False) -> None:
+    send_scancode(scan_code, key_up=False, extended=extended)
+    time.sleep(random.uniform(min_hold, max_hold))
+    send_scancode(scan_code, key_up=True, extended=extended)
 
 RATING_PRESETS = {
     "Идеал": {"perfect_brightness": 235},
@@ -38,7 +111,7 @@ class OverlayWindow:
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.color_default = "#ff2d2d"
-        self.color_success = "#1fd15d"
+        self.color_success = "#1f78ff"
         self._flash_job = None
 
         self.window = ctk.CTkToplevel(root)
@@ -87,7 +160,7 @@ class OverlayWindow:
     def mark_failure(self) -> None:
         self.set_color(self.color_default)
 
-    def flash_success(self, duration_ms: int = 120) -> None:
+    def flash_success(self, duration_ms: int = 500) -> None:
         self.set_color(self.color_success)
         if self._flash_job is not None:
             self.root.after_cancel(self._flash_job)
@@ -125,11 +198,9 @@ class BotBackend:
 
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._target_hwnd: int | None = None
 
         self.templates = self._load_arrow_templates("assets")
-
-        pydirectinput.FAILSAFE = False
-        pydirectinput.PAUSE = 0
 
     @staticmethod
     def _load_arrow_templates(assets_dir: str) -> dict[str, np.ndarray]:
@@ -210,13 +281,58 @@ class BotBackend:
         detections.sort(key=lambda item: item[1])
         return [direction for direction, _x in detections], debug_boxes
 
-    @staticmethod
-    def _press_combo(keys: list[str]) -> None:
+    def _press_combo(self, keys: list[str]) -> None:
+        self._focus_game_window()
         for key in keys:
-            pydirectinput.keyDown(key)
-            time.sleep(0.03)
-            pydirectinput.keyUp(key)
-            time.sleep(random.uniform(0.020, 0.050))
+            config = SCANCODE_MAP.get(key)
+            if config is None:
+                continue
+            tap_scancode(config["scan"], min_hold=0.04, max_hold=0.07, extended=config["extended"])
+            time.sleep(random.uniform(0.015, 0.040))
+
+    def _focus_game_window(self) -> None:
+        region = self.get_capture_region()
+        center_point = (region.left + (region.width // 2), region.top + (region.height // 2))
+
+        hwnd = win32gui.WindowFromPoint(center_point)
+        if hwnd:
+            root_hwnd = win32gui.GetAncestor(hwnd, GA_ROOT)
+            self._target_hwnd = int(root_hwnd or hwnd)
+
+        if not self._target_hwnd:
+            return
+
+        try:
+            win32gui.SetForegroundWindow(self._target_hwnd)
+            time.sleep(0.025)
+        except Exception as exc:
+            self.log(f"Не удалось фокусировать окно игры: {exc}")
+
+    def run_notepad_input_test(self) -> None:
+        self.log("ТЕСТ В БЛОКНОТЕ: через 3 секунды отправлю 'UP DOWN LEFT RIGHT' в активное поле...")
+
+        def worker() -> None:
+            time.sleep(3.0)
+            self._type_text("UP DOWN LEFT RIGHT")
+            self.log("ТЕСТ В БЛОКНОТЕ завершен.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _type_text(text: str) -> None:
+        for char in text:
+            scancode = TEXT_SCANCODE_MAP.get(char)
+            if scancode is None:
+                continue
+
+            if char != " ":
+                send_scancode(SHIFT_SCANCODE, key_up=False)
+                tap_scancode(scancode, min_hold=0.04, max_hold=0.06)
+                send_scancode(SHIFT_SCANCODE, key_up=True)
+            else:
+                tap_scancode(scancode, min_hold=0.04, max_hold=0.06)
+
+            time.sleep(random.uniform(0.03, 0.07))
 
     @staticmethod
     def _save_debug_match(frame_bgr: np.ndarray, matches: list[tuple[int, int, int, int, str, float]]) -> None:
@@ -243,9 +359,7 @@ class BotBackend:
             bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             brightness = int(np.max(bgr))
             if brightness >= self.perfect_brightness_threshold:
-                pydirectinput.keyDown("space")
-                time.sleep(0.05)
-                pydirectinput.keyUp("space")
+                tap_scancode(SCANCODE_MAP["space"]["scan"], min_hold=0.04, max_hold=0.07)
                 self.log(f"Perfect: {brightness} -> SPACE")
                 self.set_action(f"SPACE ({brightness})")
                 return True
@@ -261,9 +375,7 @@ class BotBackend:
         self._worker.start()
         self.set_status("Статус: Запущен")
         self.set_action("Сканирование")
-        pydirectinput.keyDown("space")
-        time.sleep(0.05)
-        pydirectinput.keyUp("space")
+        tap_scancode(SCANCODE_MAP["space"]["scan"], min_hold=0.04, max_hold=0.07)
         self.log("Бот запущен")
         self.log("Тест управления: SPACE прожат после нажатия СТАРТ")
 
@@ -369,6 +481,14 @@ class AristocratUI:
 
         save_btn = ctk.CTkButton(top, text="Сохранить позицию", command=self.save_region_config, fg_color="#136f48")
         save_btn.pack(side="left", padx=8, pady=8)
+
+        self.notepad_test_btn = ctk.CTkButton(
+            top,
+            text="ТЕСТ В БЛОКНОТЕ",
+            command=self.backend.run_notepad_input_test,
+            fg_color="#2563eb",
+        )
+        self.notepad_test_btn.pack(side="left", padx=8, pady=8)
 
         self.status_label = ctk.CTkLabel(top, text="Статус: Остановлен", text_color="#e8ddff")
         self.status_label.pack(side="left", padx=10)
