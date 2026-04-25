@@ -23,7 +23,10 @@ class SmartDancer:
 
         self.capture_zone = {"top": 650, "left": 400, "width": 800, "height": 250}
         self.match_threshold = 0.8
-        self.perfect_brightness_threshold = 200
+        self.perfect_brightness_threshold = 235
+        self.space_offset = 0.02
+        self.perfect_zone_left = 770
+        self.perfect_zone_width = 130
 
         self.arrow_templates = self._load_arrow_templates()
         pyautogui.PAUSE = 0
@@ -148,8 +151,9 @@ class SmartDancer:
 
         zone_top = max(0, int(height * 0.22))
         zone_bottom = max(zone_top + 1, int(height * 0.38))
-        zone_left = int(width * 0.10)
-        zone_right = int(width * 0.90)
+        zone_left = self.perfect_zone_left - self.capture_zone["left"]
+        zone_left = max(0, min(width - self.perfect_zone_width, zone_left))
+        zone_right = zone_left + self.perfect_zone_width
 
         monitor = {
             "top": self.capture_zone["top"] + zone_top,
@@ -159,6 +163,8 @@ class SmartDancer:
         }
 
         start = time.perf_counter()
+        threshold_reached = False
+        prev_max_intensity = None
         with mss.mss() as sct:
             while self.is_active and (time.perf_counter() - start) < timeout:
                 perfect_region = np.array(sct.grab(monitor))
@@ -166,12 +172,20 @@ class SmartDancer:
                 avg_intensity = float(np.mean(gray))
                 max_intensity = int(np.max(gray))
 
-                if max_intensity > self.perfect_brightness_threshold or avg_intensity > self.perfect_brightness_threshold:
-                    pyautogui.press("space")
+                if max_intensity >= self.perfect_brightness_threshold:
+                    threshold_reached = True
+
+                if threshold_reached and prev_max_intensity is not None and max_intensity < prev_max_intensity:
+                    time.sleep(self.space_offset)
+                    pyautogui.keyDown("space")
+                    time.sleep(0.05)
+                    pyautogui.keyUp("space")
                     self._append_log(
-                        f"Space нажат (max={max_intensity}, avg={avg_intensity:.1f}, порог={self.perfect_brightness_threshold})"
+                        f"Space нажат по пику (max={max_intensity}, prev={prev_max_intensity}, avg={avg_intensity:.1f}, порог={self.perfect_brightness_threshold}, offset={self.space_offset:.3f})"
                     )
                     return True
+
+                prev_max_intensity = max_intensity
 
                 time.sleep(0.001)
 
