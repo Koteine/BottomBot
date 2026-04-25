@@ -10,6 +10,18 @@ import mss
 import numpy as np
 import pydirectinput
 
+try:
+    import pygetwindow as gw
+except ImportError:
+    gw = None
+
+
+WINDOW_TITLE = "FreeStreet"
+WINDOW_ARROW_ZONE_REL = {"top": 670, "left": 290, "width": 700, "height": 120}
+WINDOW_PERFECT_ZONE_REL = {"top": 655, "left": 648, "width": 10, "height": 20}
+FALLBACK_ARROW_ZONE = {"top": 760, "left": 450, "width": 700, "height": 120}
+FALLBACK_PERFECT_ZONE = {"top": 745, "left": 808, "width": 10, "height": 20}
+
 
 @dataclass(frozen=True)
 class Zones:
@@ -20,16 +32,14 @@ class Zones:
 class InstantSmartDancer:
     def __init__(self):
         self.window = ctk.CTk()
-        self.window.title("Instant Smart Dancer (1600x900)")
-        self.window.geometry("620x560")
+        self.window.title("Instant Smart Dancer (Window mode)")
+        self.window.geometry("660x580")
         self.window.attributes("-topmost", True)
 
-        self.zones = Zones(
-            arrow_zone={"top": 740, "left": 300, "width": 1000, "height": 160},
-            perfect_zone={"top": 728, "left": 810, "width": 1, "height": 25},
-        )
-
-        self.threshold = 0.7
+        self.zones = self.resolve_capture_zones()
+        self.threshold = 0.85
+        self.perfect_brightness_threshold = 230
+        self.scan_cooldown_sec = 2.0
 
         self.auto_keys_var = ctk.BooleanVar(value=True)
         self.auto_space_var = ctk.BooleanVar(value=True)
@@ -76,15 +86,44 @@ class InstantSmartDancer:
         zone_text = (
             f"arrow_zone: {self.zones.arrow_zone}\n"
             f"perfect_zone: {self.zones.perfect_zone}\n"
-            f"threshold(gray): {self.threshold}"
+            f"threshold(gray): {self.threshold}\n"
+            f"perfect_brightness: {self.perfect_brightness_threshold}\n"
+            f"scan_cooldown: {self.scan_cooldown_sec}s"
         )
         self.zone_label = ctk.CTkLabel(self.window, text=zone_text)
         self.zone_label.pack(pady=(0, 10))
 
-        self.log_box = ctk.CTkTextbox(self.window, width=580, height=320)
+        self.log_box = ctk.CTkTextbox(self.window, width=620, height=340)
         self.log_box.pack(padx=14, pady=(0, 14), fill="both", expand=True)
         self.log_box.insert("end", "Instant Smart Dancer log\n")
         self.log_box.configure(state="disabled")
+
+    @staticmethod
+    def _apply_window_offset(zone_rel: dict, window_left: int, window_top: int):
+        return {
+            "top": int(window_top + zone_rel["top"]),
+            "left": int(window_left + zone_rel["left"]),
+            "width": int(zone_rel["width"]),
+            "height": int(zone_rel["height"]),
+        }
+
+    def resolve_capture_zones(self):
+        if gw is None:
+            return Zones(arrow_zone=FALLBACK_ARROW_ZONE, perfect_zone=FALLBACK_PERFECT_ZONE)
+
+        try:
+            windows = gw.getWindowsWithTitle(WINDOW_TITLE)
+        except Exception:
+            windows = []
+
+        visible_windows = [w for w in windows if getattr(w, "width", 0) > 0 and getattr(w, "height", 0) > 0]
+        if not visible_windows:
+            return Zones(arrow_zone=FALLBACK_ARROW_ZONE, perfect_zone=FALLBACK_PERFECT_ZONE)
+
+        target = visible_windows[0]
+        arrow_zone = self._apply_window_offset(WINDOW_ARROW_ZONE_REL, target.left, target.top)
+        perfect_zone = self._apply_window_offset(WINDOW_PERFECT_ZONE_REL, target.left, target.top)
+        return Zones(arrow_zone=arrow_zone, perfect_zone=perfect_zone)
 
     def _append_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -138,8 +177,8 @@ class InstantSmartDancer:
 
     @staticmethod
     def press_keys_instant(found_keys):
-        for key in found_keys:
-            pydirectinput.press(key, _pause=False)
+        if found_keys:
+            pydirectinput.typewrite(found_keys, interval=0)
 
     def wait_for_perfect_and_space(self, sct):
         timeout_sec = 2.0
@@ -155,9 +194,9 @@ class InstantSmartDancer:
             perfect_bgr = cv2.cvtColor(perfect_frame, cv2.COLOR_BGRA2BGR)
             brightness = int(np.max(perfect_bgr))
 
-            if brightness > 240:
+            if brightness > self.perfect_brightness_threshold:
                 pydirectinput.press("space", _pause=False)
-                self.window.after(0, self._set_last_action, "Perfect > 240 -> SPACE")
+                self.window.after(0, self._set_last_action, f"Perfect > {self.perfect_brightness_threshold} -> SPACE")
                 self.window.after(0, self._append_log, f"Perfect detected ({brightness}) -> SPACE")
                 return
 
@@ -174,7 +213,7 @@ class InstantSmartDancer:
 
                 if not combo:
                     self.window.after(0, self._set_last_action, "Стрелки не найдены")
-                    time.sleep(0.001)
+                    time.sleep(0.01)
                     continue
 
                 found_keys = [item["direction"] for item in combo]
@@ -184,14 +223,15 @@ class InstantSmartDancer:
 
                 if self.auto_keys_enabled:
                     self.press_keys_instant(found_keys)
-                    self.window.after(0, self._set_last_action, f"Нажаты стрелки: {combo_names}")
-                    self.window.after(0, self._append_log, f"Комбинация нажата мгновенно: {combo_names}")
+                    self.window.after(0, self._set_last_action, f"Нажата цепочка: {combo_names}")
+                    self.window.after(0, self._append_log, f"Цепочка нажата одним вызовом: {combo_names}")
 
                 if self.auto_space_enabled:
                     self.window.after(0, self._set_last_action, "Мониторинг Perfect (до 2с)")
                     self.wait_for_perfect_and_space(sct)
 
-                time.sleep(0.001)
+                self.window.after(0, self._append_log, f"Cooldown {self.scan_cooldown_sec:.1f}s перед новым сканированием")
+                time.sleep(self.scan_cooldown_sec)
 
     def toggle(self):
         if self.is_active:
@@ -201,6 +241,7 @@ class InstantSmartDancer:
 
     def start(self):
         self._sync_runtime_settings()
+        self.zones = self.resolve_capture_zones()
         self.is_active = True
         self.stop_event.clear()
         self.worker_thread = threading.Thread(target=self.worker_loop, daemon=True)
@@ -209,7 +250,7 @@ class InstantSmartDancer:
         self.start_button.configure(text="СТОП", fg_color="red")
         self.status_label.configure(text="Статус: Работает")
         self._set_last_action("Бот запущен")
-        self._append_log("Бот запущен (Instant режим)")
+        self._append_log(f"Бот запущен (Window режим, threshold={self.threshold}, cooldown={self.scan_cooldown_sec}s)")
 
     def stop(self):
         self.is_active = False
