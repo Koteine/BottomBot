@@ -1,4 +1,5 @@
 import json
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -110,8 +111,8 @@ class BotBackend:
         self.auto_space_enabled = True
         self.template_threshold = 0.82
         self.perfect_brightness_threshold = 225
-        self.scan_cooldown_sec = 0.001
-        self.beat_lock_sec = 0.16
+        self.scan_cooldown_sec = 0.01
+        self.post_combo_sleep_sec = 2.0
         self.is_active = False
 
         self._region_lock = threading.Lock()
@@ -143,8 +144,13 @@ class BotBackend:
             template = cv2.imread(f"{assets_dir}/{filename}", cv2.IMREAD_GRAYSCALE)
             if template is None:
                 raise FileNotFoundError(f"Не найден шаблон: {assets_dir}/{filename}")
-            templates[key] = cv2.GaussianBlur(template, (3, 3), 0)
+            templates[key] = BotBackend._to_binary(template)
         return templates
+
+    @staticmethod
+    def _to_binary(gray_image: np.ndarray, threshold: int = 200) -> np.ndarray:
+        _ret, binary = cv2.threshold(gray_image, threshold, 255, cv2.THRESH_BINARY)
+        return binary
 
     def set_capture_region(self, left: int, top: int, width: int, height: int) -> None:
         with self._region_lock:
@@ -173,38 +179,61 @@ class BotBackend:
         preset = RATING_PRESETS.get(rating_mode, RATING_PRESETS["Круто"])
         self.perfect_brightness_threshold = preset["perfect_brightness"]
 
-    def _detect_keys(self, gray_frame: np.ndarray) -> tuple[list[str], dict[str, float]]:
-        blurred = cv2.GaussianBlur(gray_frame, (3, 3), 0)
-        detections = []
-        scores: dict[str, float] = {}
+    def _detect_keys(self, binary_frame: np.ndarray) -> tuple[list[str], list[tuple[int, int, int, int, str, float]]]:
+        contours, _hier = cv2.findContours(binary_frame, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        detections: list[tuple[str, int]] = []
+        debug_boxes: list[tuple[int, int, int, int, str, float]] = []
 
-        for direction, template in self.templates.items():
-            res = cv2.matchTemplate(blurred, template, cv2.TM_CCOEFF_NORMED)
-            _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(res)
-            score = float(max_val)
-            if score >= self.template_threshold:
-                h, w = template.shape
-                center_x = int(max_loc[0] + w / 2)
-                detections.append((direction, center_x))
-                scores[direction] = score
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = w * h
+            if area < 120 or w < 10 or h < 10:
+                continue
 
-        detections.sort(key=lambda t: t[1])
-        return [direction for direction, _x in detections], scores
+            roi = binary_frame[y : y + h, x : x + w]
+            best_direction = ""
+            best_score = -1.0
 
-    def _trigger_has_arrow(self, gray_trigger: np.ndarray) -> bool:
-        blurred = cv2.GaussianBlur(gray_trigger, (3, 3), 0)
-        for template in self.templates.values():
-            res = cv2.matchTemplate(blurred, template, cv2.TM_CCOEFF_NORMED)
-            if float(np.max(res)) >= (self.template_threshold - 0.03):
-                return True
-        return False
+            for direction, template in self.templates.items():
+                resized_template = cv2.resize(template, (w, h), interpolation=cv2.INTER_NEAREST)
+                res = cv2.matchTemplate(roi, resized_template, cv2.TM_CCOEFF_NORMED)
+                score = float(np.max(res))
+                if score > best_score:
+                    best_score = score
+                    best_direction = direction
+
+            if best_score >= self.template_threshold:
+                center_x = int(x + (w / 2))
+                detections.append((best_direction, center_x))
+                debug_boxes.append((x, y, w, h, best_direction, best_score))
+
+        detections.sort(key=lambda item: item[1])
+        return [direction for direction, _x in detections], debug_boxes
 
     @staticmethod
     def _press_combo(keys: list[str]) -> None:
         for key in keys:
             pydirectinput.keyDown(key)
-            time.sleep(0.05)
+            time.sleep(0.03)
             pydirectinput.keyUp(key)
+            time.sleep(random.uniform(0.020, 0.050))
+
+    @staticmethod
+    def _save_debug_match(frame_bgr: np.ndarray, matches: list[tuple[int, int, int, int, str, float]]) -> None:
+        debug = frame_bgr.copy()
+        for x, y, w, h, direction, score in matches:
+            cv2.rectangle(debug, (x, y), (x + w, y + h), (57, 255, 20), 2)
+            cv2.putText(
+                debug,
+                f"{direction}:{score:.2f}",
+                (x, max(12, y - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (57, 255, 20),
+                1,
+                cv2.LINE_AA,
+            )
+        cv2.imwrite("debug_match.png", debug)
 
     def _wait_perfect_and_space(self, sct: mss.mss, region: dict) -> bool:
         timeout_sec = 1.8
@@ -252,7 +281,6 @@ class BotBackend:
 
     def _worker_loop(self) -> None:
         with mss.mss() as sct:
-            vision_locked_until = 0.0
             last_scan_log_t = 0.0
             last_scan_region: tuple[int, int, int, int] | None = None
 
@@ -271,41 +299,30 @@ class BotBackend:
                     self.log(f"Сканирую область [{region.left}, {region.top}, {region.width}, {region.height}]...")
                     last_scan_log_t = now
                     last_scan_region = region_tuple
-                if now < vision_locked_until:
-                    time.sleep(self.scan_cooldown_sec)
-                    continue
 
                 full = np.array(sct.grab(monitor))
+                full_bgr = cv2.cvtColor(full, cv2.COLOR_BGRA2BGR)
                 full_gray = cv2.cvtColor(full, cv2.COLOR_BGRA2GRAY)
+                full_binary = self._to_binary(full_gray)
 
-                trigger_width = min(TRIGGER_SLICE_WIDTH, full_gray.shape[1])
-                trigger_gray = full_gray[:, :trigger_width]
-
-                if not self._trigger_has_arrow(trigger_gray):
-                    self.vision_feedback(False)
-                    time.sleep(self.scan_cooldown_sec)
-                    continue
-
-                keys, scores = self._detect_keys(full_gray)
+                keys, matches = self._detect_keys(full_binary)
                 if not keys:
                     self.vision_feedback(False)
                     time.sleep(self.scan_cooldown_sec)
                     continue
 
-                for key in keys:
-                    self.log(f"Найдена стрелка: {key} с точностью {scores.get(key, 0.0):.3f}")
+                self._save_debug_match(full_bgr, matches)
+                for _x, _y, _w, _h, direction, score in matches:
+                    self.log(f"Найдена стрелка: {direction} с точностью {score:.3f}")
 
                 self.vision_feedback(True)
-                vision_locked_until = time.perf_counter() + self.beat_lock_sec
 
                 if self.auto_keys_enabled:
                     self._press_combo(keys)
                     self.log(f"Комбо: {keys}")
                     self.set_action("Комбо: " + ", ".join(k.upper() for k in keys))
 
-                if self.auto_space_enabled:
-                    if not self._wait_perfect_and_space(sct, monitor):
-                        self.set_action("Perfect не найден")
+                time.sleep(self.post_combo_sleep_sec)
 
 
 class AristocratUI:
