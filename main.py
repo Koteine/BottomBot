@@ -12,7 +12,6 @@ import customtkinter as ctk
 import cv2
 import mss
 import numpy as np
-import win32gui
 
 CONFIG_PATH = Path("overlay_position.json")
 DEFAULT_REGION = {"x": 450, "y": 760, "width": 1100, "height": 120}
@@ -51,10 +50,9 @@ INPUT_KEYBOARD = 1
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
-GA_ROOT = 2
 
 
-class KEYBDINPUT(ctypes.Structure):
+class KeybdInput(ctypes.Structure):
     _fields_ = [
         ("wVk", ctypes.c_ushort),
         ("wScan", ctypes.c_ushort),
@@ -64,12 +62,35 @@ class KEYBDINPUT(ctypes.Structure):
     ]
 
 
-class _INPUTUNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT)]
+class MouseInput(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class HardwareInput(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.c_ulong),
+        ("wParamL", ctypes.c_short),
+        ("wParamH", ctypes.c_ushort),
+    ]
+
+
+class Input_I(ctypes.Union):
+    _fields_ = [
+        ("ki", KeybdInput),
+        ("mi", MouseInput),
+        ("hi", HardwareInput),
+    ]
 
 
 class INPUT(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_ulong), ("union", _INPUTUNION)]
+    _fields_ = [("type", ctypes.c_ulong), ("ii", Input_I)]
 
 
 def send_scancode(scan_code: int, key_up: bool = False, extended: bool = False) -> None:
@@ -80,8 +101,9 @@ def send_scancode(scan_code: int, key_up: bool = False, extended: bool = False) 
         flags |= KEYEVENTF_EXTENDEDKEY
 
     extra = ctypes.c_ulong(0)
-    keyboard_input = KEYBDINPUT(0, scan_code, flags, 0, ctypes.pointer(extra))
-    payload = INPUT(INPUT_KEYBOARD, _INPUTUNION(ki=keyboard_input))
+    ii = Input_I()
+    ii.ki = KeybdInput(0, scan_code, flags, 0, ctypes.pointer(extra))
+    payload = INPUT(INPUT_KEYBOARD, ii)
     ctypes.windll.user32.SendInput(1, ctypes.byref(payload), ctypes.sizeof(INPUT))
 
 
@@ -110,18 +132,18 @@ class OverlayWindow:
 
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
-        self.color_default = "#ff2d2d"
-        self.color_success = "#1f78ff"
+        self.color_default = "#1f78ff"
+        self.color_success = "#4da3ff"
         self._flash_job = None
 
         self.window = ctk.CTkToplevel(root)
         self.window.overrideredirect(True)
         self.window.attributes("-topmost", True)
-        self.window.configure(fg_color="white")
+        self.window.configure(fg_color="grey")
 
-        # Для Windows: белый цвет становится прозрачным.
+        # Для Windows: серый цвет становится прозрачным.
         try:
-            self.window.attributes("-transparentcolor", "white")
+            self.window.attributes("-transparentcolor", "grey")
         except Exception:
             pass
 
@@ -131,7 +153,7 @@ class OverlayWindow:
         except Exception:
             pass
 
-        self.canvas = ctk.CTkCanvas(self.window, bg="white", bd=0, highlightthickness=0)
+        self.canvas = ctk.CTkCanvas(self.window, bg="grey", bd=0, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.rect_id = self.canvas.create_rectangle(1, 1, 10, 10, outline=self.color_default, width=2)
 
@@ -182,8 +204,10 @@ class BotBackend:
 
         self.auto_keys_enabled = True
         self.auto_space_enabled = True
+        self.game_window_title = "FreeStreet"
         self.template_threshold = 0.82
         self.perfect_brightness_threshold = 225
+        self.perfect_offset_ms = 0
         self.scan_cooldown_sec = 0.01
         self.post_combo_sleep_sec = 2.0
         self.is_active = False
@@ -198,7 +222,6 @@ class BotBackend:
 
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._target_hwnd: int | None = None
 
         self.templates = self._load_arrow_templates("assets")
 
@@ -240,12 +263,16 @@ class BotBackend:
         self,
         auto_keys: bool,
         auto_space: bool,
+        game_window_title: str,
         rating_mode: str,
         precision_threshold: float,
+        perfect_offset_ms: int,
     ) -> None:
         self.auto_keys_enabled = auto_keys
         self.auto_space_enabled = auto_space
+        self.game_window_title = game_window_title.strip() or "FreeStreet"
         self.template_threshold = max(0.75, min(0.99, float(precision_threshold)))
+        self.perfect_offset_ms = max(-20, min(20, int(perfect_offset_ms)))
 
         preset = RATING_PRESETS.get(rating_mode, RATING_PRESETS["Круто"])
         self.perfect_brightness_threshold = preset["perfect_brightness"]
@@ -282,31 +309,30 @@ class BotBackend:
         return [direction for direction, _x in detections], debug_boxes
 
     def _press_combo(self, keys: list[str]) -> None:
-        self._focus_game_window()
         for key in keys:
             config = SCANCODE_MAP.get(key)
             if config is None:
                 continue
             tap_scancode(config["scan"], min_hold=0.04, max_hold=0.07, extended=config["extended"])
-            time.sleep(random.uniform(0.015, 0.040))
+            self.log(f"[DirectX] Нажата {key.upper()}.")
+            time.sleep(random.uniform(0.02, 0.05))
 
-    def _focus_game_window(self) -> None:
-        region = self.get_capture_region()
-        center_point = (region.left + (region.width // 2), region.top + (region.height // 2))
+    @staticmethod
+    def _get_foreground_title() -> str:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        title_buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title_buffer, length + 1)
+        return title_buffer.value
 
-        hwnd = win32gui.WindowFromPoint(center_point)
-        if hwnd:
-            root_hwnd = win32gui.GetAncestor(hwnd, GA_ROOT)
-            self._target_hwnd = int(root_hwnd or hwnd)
-
-        if not self._target_hwnd:
-            return
-
-        try:
-            win32gui.SetForegroundWindow(self._target_hwnd)
-            time.sleep(0.025)
-        except Exception as exc:
-            self.log(f"Не удалось фокусировать окно игры: {exc}")
+    def _is_game_window_focused(self) -> bool:
+        title = self._get_foreground_title().lower()
+        return self.game_window_title.lower() in title
 
     def run_notepad_input_test(self) -> None:
         self.log("ТЕСТ В БЛОКНОТЕ: через 3 секунды отправлю 'UP DOWN LEFT RIGHT' в активное поле...")
@@ -359,8 +385,12 @@ class BotBackend:
             bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             brightness = int(np.max(bgr))
             if brightness >= self.perfect_brightness_threshold:
+                jitter_ms = random.randint(-10, 10)
+                total_offset_ms = self.perfect_offset_ms + jitter_ms
+                if total_offset_ms > 0:
+                    time.sleep(total_offset_ms / 1000.0)
                 tap_scancode(SCANCODE_MAP["space"]["scan"], min_hold=0.04, max_hold=0.07)
-                self.log(f"Perfect: {brightness} -> SPACE")
+                self.log(f"[DirectX] Нажата SPACE. Perfect={brightness}, offset={total_offset_ms}ms")
                 self.set_action(f"SPACE ({brightness})")
                 return True
             time.sleep(0.001)
@@ -395,8 +425,17 @@ class BotBackend:
         with mss.mss() as sct:
             last_scan_log_t = 0.0
             last_scan_region: tuple[int, int, int, int] | None = None
+            last_focus_log_t = 0.0
 
             while self.is_active and not self._stop_event.is_set():
+                if not self._is_game_window_focused():
+                    now = time.perf_counter()
+                    if now - last_focus_log_t >= 1.0:
+                        self.log("Ожидание фокуса игры....")
+                        last_focus_log_t = now
+                    time.sleep(0.05)
+                    continue
+
                 region = self.get_capture_region()
                 monitor = {
                     "left": region.left,
@@ -434,6 +473,9 @@ class BotBackend:
                     self.log(f"Комбо: {keys}")
                     self.set_action("Комбо: " + ", ".join(k.upper() for k in keys))
 
+                if self.auto_space_enabled:
+                    self._wait_perfect_and_space(sct, monitor)
+
                 time.sleep(self.post_combo_sleep_sec)
 
 
@@ -452,8 +494,10 @@ class AristocratUI:
 
         self.auto_keys_var = ctk.BooleanVar(value=True)
         self.auto_space_var = ctk.BooleanVar(value=True)
+        self.game_window_title_var = ctk.StringVar(value="FreeStreet")
         self.rating_mode_var = ctk.StringVar(value="Круто")
         self.precision_threshold_var = ctk.DoubleVar(value=0.82)
+        self.perfect_offset_var = ctk.IntVar(value=0)
 
         saved = self._load_region_config()
         self.region_x_var = ctk.IntVar(value=saved["x"])
@@ -466,6 +510,7 @@ class AristocratUI:
 
         self._build_layout()
         self._bind_region_traces()
+        self.game_window_title_var.trace_add("write", lambda *_: self._sync_backend())
         self._sync_backend()
         self._apply_region_to_overlay_and_backend()
 
@@ -516,6 +561,11 @@ class AristocratUI:
             anchor="w", padx=14, pady=6
         )
 
+        game_row = ctk.CTkFrame(frame, fg_color="transparent")
+        game_row.pack(fill="x", padx=14, pady=6)
+        ctk.CTkLabel(game_row, text="Окно игры").pack(side="left")
+        ctk.CTkEntry(game_row, textvariable=self.game_window_title_var).pack(side="right", fill="x", expand=True, padx=(10, 0))
+
         mode_row = ctk.CTkFrame(frame, fg_color="transparent")
         mode_row.pack(fill="x", padx=14, pady=(8, 6))
         ctk.CTkLabel(mode_row, text="Режим оценки").pack(side="left")
@@ -535,6 +585,18 @@ class AristocratUI:
             to=0.99,
             number_of_steps=24,
             variable=self.precision_threshold_var,
+            command=lambda _v: self._sync_backend(),
+        ).pack(side="right", fill="x", expand=True, padx=(10, 0))
+
+        offset_row = ctk.CTkFrame(frame, fg_color="transparent")
+        offset_row.pack(fill="x", padx=14, pady=6)
+        ctk.CTkLabel(offset_row, text="Смещение Perfect (мс)").pack(side="left")
+        ctk.CTkSlider(
+            offset_row,
+            from_=-20,
+            to=20,
+            number_of_steps=40,
+            variable=self.perfect_offset_var,
             command=lambda _v: self._sync_backend(),
         ).pack(side="right", fill="x", expand=True, padx=(10, 0))
 
@@ -610,8 +672,10 @@ class AristocratUI:
         self.backend.update_settings(
             auto_keys=bool(self.auto_keys_var.get()),
             auto_space=bool(self.auto_space_var.get()),
+            game_window_title=self.game_window_title_var.get(),
             rating_mode=self.rating_mode_var.get(),
             precision_threshold=float(self.precision_threshold_var.get()),
+            perfect_offset_ms=int(self.perfect_offset_var.get()),
         )
 
     def append_log(self, message: str) -> None:
