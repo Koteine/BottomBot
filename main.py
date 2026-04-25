@@ -16,9 +16,10 @@ SCAN_AREA = {"left": 450, "top": 690, "width": 742, "height": 65}
 PERFECT_ZONE = {"left": 810, "top": 715, "width": 20, "height": 20}
 
 TEMPLATE_THRESHOLD = 0.70
-PERFECT_BRIGHTNESS = 230.0
-KEY_DOWN_TIME = 0.05
+PERFECT_BRIGHTNESS = 200.0
 POST_CHAIN_SLEEP = 1.0
+PERFECT_WAIT_TIMEOUT = 3.0
+SPACE_POST_PRESS_SLEEP = 1.5
 IDLE_SLEEP = 0.01
 
 KEY_MAP = {
@@ -104,9 +105,8 @@ class BottomBot:
 
     @staticmethod
     def _press_direct_key(key: str) -> None:
-        pydirectinput.keyDown(key)
-        time.sleep(KEY_DOWN_TIME)
-        pydirectinput.keyUp(key)
+        pydirectinput.PAUSE = 0.01
+        pydirectinput.press(key)
 
     def _press_chain(self, chain: list[str]) -> None:
         keys = [KEY_MAP[d] for d in chain if d in KEY_MAP]
@@ -121,12 +121,19 @@ class BottomBot:
         time.sleep(POST_CHAIN_SLEEP)
 
     def _wait_for_perfect(self, sct: mss.mss) -> None:
+        wait_started = time.monotonic()
         while self.is_running:
             perfect = self._to_gray(sct, PERFECT_ZONE)
             if float(np.mean(perfect)) >= PERFECT_BRIGHTNESS:
                 self._press_direct_key("space")
                 self.log("Perfect!")
+                time.sleep(SPACE_POST_PRESS_SLEEP)
                 return
+
+            if time.monotonic() - wait_started >= PERFECT_WAIT_TIMEOUT:
+                self.log("[Система] Вспышка не найдена, сброс к поиску стрелок")
+                return
+
             time.sleep(0.005)
 
     def _run(self) -> None:
@@ -148,6 +155,7 @@ class BottomBot:
                     self._press_chain(chain)
                     self._wait_for_perfect(sct)
                 except Exception as exc:
+                    print(exc)
                     self.log(f"Ошибка в цикле: {exc}")
                     time.sleep(0.1)
 
