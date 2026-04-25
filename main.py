@@ -18,15 +18,16 @@ except ImportError:
 
 WINDOW_TITLE = "FreeStreet"
 WINDOW_MIN_SIZE = (200, 200)
+DEBUG_SCAN_PATH = Path("last_scan.png")
 
-# Координаты относительно окна игры
-ARROW_ZONE_REL = {"top": 740, "left": 260, "width": 1400, "height": 110}  # y: 740..850
-PERFECT_ZONE_REL = {"top": 740, "left": 805, "width": 20, "height": 110}  # x ~ 810
+# Координаты относительно окна игры (1080p)
+ARROW_ZONE_REL = {"top": 750, "left": 450, "width": 1100, "height": 120}
+PERFECT_ZONE_REL = {"top": 750, "left": 995, "width": 30, "height": 120}
 
 RATING_PRESETS = {
-    "Идеал": {"template_threshold": 0.90, "perfect_brightness": 235},
-    "Круто": {"template_threshold": 0.85, "perfect_brightness": 225},
-    "Хорошо": {"template_threshold": 0.80, "perfect_brightness": 210},
+    "Идеал": {"perfect_brightness": 235},
+    "Круто": {"perfect_brightness": 225},
+    "Хорошо": {"perfect_brightness": 210},
 }
 
 
@@ -44,7 +45,7 @@ class BotBackend:
 
         self.auto_keys_enabled = True
         self.auto_space_enabled = True
-        self.template_threshold = 0.85
+        self.template_threshold = 0.65
         self.perfect_brightness_threshold = 225
         self.scan_cooldown_sec = 0.02
         self.is_active = False
@@ -71,7 +72,7 @@ class BotBackend:
             template = cv2.imread(str(full_path), cv2.IMREAD_GRAYSCALE)
             if template is None:
                 raise FileNotFoundError(f"Не найден шаблон: {full_path}")
-            templates[key] = template
+            templates[key] = cv2.GaussianBlur(template, (3, 3), 0)
         return templates
 
     @staticmethod
@@ -101,6 +102,16 @@ class BotBackend:
         ]
         return candidates[0] if candidates else None
 
+    @staticmethod
+    def _is_window_active(window) -> bool:
+        attr = getattr(window, "isActive", None)
+        if callable(attr):
+            try:
+                return bool(attr())
+            except Exception:
+                return False
+        return bool(attr)
+
     def _get_capture_zones(self) -> CaptureZones | None:
         window = self._resolve_game_window()
         if window is None:
@@ -108,8 +119,7 @@ class BotBackend:
             self.set_action("Ожидание окна игры")
             return None
 
-        is_active = bool(getattr(window, "isActive", False))
-        if not is_active:
+        if not self._is_window_active(window):
             self.set_status("Статус: Окно FreeStreet не активно")
             self.set_action("Активируйте окно игры")
             return None
@@ -119,9 +129,10 @@ class BotBackend:
         return CaptureZones(arrow_zone=arrow_zone, perfect_zone=perfect_zone)
 
     def _detect_keys(self, gray_frame: np.ndarray) -> list[str]:
+        blurred_frame = cv2.GaussianBlur(gray_frame, (3, 3), 0)
         detections = []
         for direction, template in self.templates.items():
-            result = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
+            result = cv2.matchTemplate(blurred_frame, template, cv2.TM_CCOEFF_NORMED)
             ys, xs = np.where(result >= self.template_threshold)
             h, w = template.shape
             for y, x in zip(ys, xs):
@@ -132,8 +143,8 @@ class BotBackend:
 
     @staticmethod
     def _press_keys_instant(keys: list[str]) -> None:
-        if keys:
-            pydirectinput.typewrite(keys, interval=0)
+        for key in keys:
+            pydirectinput.press(key, _pause=False)
 
     def _wait_perfect_and_space(self, sct, zones: CaptureZones) -> bool:
         timeout_sec = 1.0
@@ -150,12 +161,12 @@ class BotBackend:
             time.sleep(0.001)
         return False
 
-    def update_settings(self, auto_keys: bool, auto_space: bool, rating_mode: str, score_threshold: int) -> None:
+    def update_settings(self, auto_keys: bool, auto_space: bool, rating_mode: str, precision_threshold: float) -> None:
         self.auto_keys_enabled = auto_keys
         self.auto_space_enabled = auto_space
 
         preset = RATING_PRESETS.get(rating_mode, RATING_PRESETS["Круто"])
-        self.template_threshold = max(0.5, min(0.99, score_threshold / 100))
+        self.template_threshold = max(0.1, min(1.0, float(precision_threshold)))
         self.perfect_brightness_threshold = preset["perfect_brightness"]
 
     def start(self) -> None:
@@ -194,6 +205,8 @@ class BotBackend:
                 keys = self._detect_keys(gray)
 
                 if not keys:
+                    bgr_scan = cv2.cvtColor(arrow_frame, cv2.COLOR_BGRA2BGR)
+                    cv2.imwrite(str(DEBUG_SCAN_PATH), bgr_scan)
                     self.set_action("Стрелки не найдены")
                     time.sleep(self.scan_cooldown_sec)
                     continue
@@ -217,15 +230,16 @@ class AristocratUI:
 
         self.root = ctk.CTk()
         self.root.title("BottomBot — Аристократ")
-        self.root.geometry("860x620")
-        self.root.minsize(820, 580)
+        self.root.geometry("600x400")
+        self.root.resizable(True, True)
+        self.root.minsize(600, 400)
 
         self._setup_styles()
 
         self.auto_keys_var = ctk.BooleanVar(value=True)
         self.auto_space_var = ctk.BooleanVar(value=True)
         self.rating_mode_var = ctk.StringVar(value="Круто")
-        self.score_threshold_var = ctk.IntVar(value=85)
+        self.precision_threshold_var = ctk.DoubleVar(value=0.65)
 
         self.backend = BotBackend(self.append_log, self.set_status, self.set_last_action)
 
@@ -236,8 +250,11 @@ class AristocratUI:
         self.root.configure(fg_color="#11081f")
 
     def _build_layout(self) -> None:
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=1)
+
         top = ctk.CTkFrame(self.root, fg_color="#1b0f2f", corner_radius=16)
-        top.pack(fill="x", padx=14, pady=(14, 10))
+        top.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 10))
 
         self.start_btn = ctk.CTkButton(
             top,
@@ -261,7 +278,7 @@ class AristocratUI:
             segmented_button_selected_hover_color="#7a3cb7",
             fg_color="#1b0f2f",
         )
-        tabs.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        tabs.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
 
         main_tab = tabs.add("Основное")
         ui_tab = tabs.add("Настройки UI")
@@ -306,25 +323,6 @@ class AristocratUI:
         )
         self.rating_menu.pack(side="right")
 
-        slider_row = ctk.CTkFrame(block, fg_color="transparent")
-        slider_row.pack(fill="x", padx=18, pady=(10, 2))
-        ctk.CTkLabel(slider_row, text="Порог очков").pack(side="left")
-        self.threshold_value_label = ctk.CTkLabel(slider_row, text=str(self.score_threshold_var.get()))
-        self.threshold_value_label.pack(side="right")
-
-        self.threshold_slider = ctk.CTkSlider(
-            block,
-            from_=50,
-            to=99,
-            number_of_steps=49,
-            variable=self.score_threshold_var,
-            progress_color="#8e44d9",
-            button_color="#c77dff",
-            button_hover_color="#e0a3ff",
-            command=self._on_threshold_change,
-        )
-        self.threshold_slider.pack(fill="x", padx=18, pady=(2, 16))
-
     def _build_ui_tab(self, tab) -> None:
         frame = ctk.CTkFrame(tab, fg_color="#22133a")
         frame.pack(fill="both", expand=True, padx=12, pady=12)
@@ -339,24 +337,46 @@ class AristocratUI:
             anchor="w", padx=18, pady=10
         )
 
+        precision_row = ctk.CTkFrame(frame, fg_color="transparent")
+        precision_row.pack(fill="x", padx=18, pady=(10, 2))
+        ctk.CTkLabel(precision_row, text="Точность (0.1 - 1.0)").pack(side="left")
+        self.precision_value_label = ctk.CTkLabel(precision_row, text=f"{self.precision_threshold_var.get():.2f}")
+        self.precision_value_label.pack(side="right")
+
+        self.precision_slider = ctk.CTkSlider(
+            frame,
+            from_=0.1,
+            to=1.0,
+            number_of_steps=90,
+            variable=self.precision_threshold_var,
+            progress_color="#8e44d9",
+            button_color="#c77dff",
+            button_hover_color="#e0a3ff",
+            command=self._on_precision_change,
+        )
+        self.precision_slider.pack(fill="x", padx=18, pady=(2, 16))
+
         ctk.CTkLabel(
             frame,
             text="Тема: Аристократ (тёмно-фиолетовая)\nМодульная структура: вкладки можно расширять новыми блоками.",
             justify="left",
             text_color="#cdb6ff",
-        ).pack(anchor="w", padx=18, pady=(14, 10))
+        ).pack(anchor="w", padx=18, pady=(4, 10))
 
     def _build_logs_tab(self, tab) -> None:
+        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
         self.log_box = ctk.CTkTextbox(tab, fg_color="#120a22", text_color="#e7d9ff")
-        self.log_box.pack(fill="both", expand=True, padx=12, pady=12)
+        self.log_box.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         self.log_box.insert("end", "[INIT] Логи BottomBot\n")
         self.log_box.configure(state="disabled")
 
     def _toggle_topmost(self) -> None:
         self.root.attributes("-topmost", bool(self.topmost_var.get()))
 
-    def _on_threshold_change(self, value: float) -> None:
-        self.threshold_value_label.configure(text=str(int(value)))
+    def _on_precision_change(self, value: float) -> None:
+        self.precision_value_label.configure(text=f"{value:.2f}")
         self._sync_backend()
 
     def _sync_backend(self) -> None:
@@ -364,7 +384,7 @@ class AristocratUI:
             auto_keys=bool(self.auto_keys_var.get()),
             auto_space=bool(self.auto_space_var.get()),
             rating_mode=self.rating_mode_var.get(),
-            score_threshold=int(self.score_threshold_var.get()),
+            precision_threshold=float(self.precision_threshold_var.get()),
         )
 
     def append_log(self, message: str) -> None:
