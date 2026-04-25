@@ -20,9 +20,9 @@ WINDOW_TITLE = "FreeStreet"
 WINDOW_MIN_SIZE = (200, 200)
 DEBUG_SCAN_PATH = Path("last_scan.png")
 
-# Координаты относительно окна игры (1080p)
-ARROW_ZONE_REL = {"top": 750, "left": 450, "width": 1100, "height": 120}
-PERFECT_ZONE_REL = {"top": 750, "left": 995, "width": 30, "height": 120}
+# Координаты относительно окна игры (1920x1080, windowed)
+ARROW_ZONE_REL = {"top": 760, "left": 450, "width": 1100, "height": 120}
+PERFECT_ZONE_REL = {"top": 745, "left": 808, "width": 30, "height": 120}
 
 RATING_PRESETS = {
     "Идеал": {"perfect_brightness": 235},
@@ -45,10 +45,11 @@ class BotBackend:
 
         self.auto_keys_enabled = True
         self.auto_space_enabled = True
-        self.template_threshold = 0.65
+        self.template_threshold = 0.8
         self.perfect_brightness_threshold = 225
         self.scan_cooldown_sec = 0.02
         self.is_active = False
+        self.can_scan = True
 
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -144,17 +145,21 @@ class BotBackend:
     @staticmethod
     def _press_keys_instant(keys: list[str]) -> None:
         for key in keys:
-            pydirectinput.press(key, _pause=False)
+            pydirectinput.keyDown(key, _pause=False)
+            time.sleep(0.02)
+            pydirectinput.keyUp(key, _pause=False)
 
     def _wait_perfect_and_space(self, sct, zones: CaptureZones) -> bool:
-        timeout_sec = 1.0
+        timeout_sec = 3.0
         start = time.perf_counter()
         while self.is_active and not self._stop_event.is_set() and (time.perf_counter() - start) <= timeout_sec:
             perfect_frame = np.array(sct.grab(zones.perfect_zone))
             bgr = cv2.cvtColor(perfect_frame, cv2.COLOR_BGRA2BGR)
             brightness = int(np.max(bgr))
             if brightness >= self.perfect_brightness_threshold:
-                pydirectinput.press("space", _pause=False)
+                pydirectinput.keyDown("space", _pause=False)
+                time.sleep(0.02)
+                pydirectinput.keyUp("space", _pause=False)
                 self.set_action(f"SPACE ({brightness})")
                 self.log(f"Perfect зона активна ({brightness}) -> SPACE")
                 return True
@@ -166,13 +171,14 @@ class BotBackend:
         self.auto_space_enabled = auto_space
 
         preset = RATING_PRESETS.get(rating_mode, RATING_PRESETS["Круто"])
-        self.template_threshold = max(0.1, min(1.0, float(precision_threshold)))
+        self.template_threshold = max(0.8, min(1.0, float(precision_threshold)))
         self.perfect_brightness_threshold = preset["perfect_brightness"]
 
     def start(self) -> None:
         if self.is_active:
             return
         self.is_active = True
+        self.can_scan = True
         self._stop_event.clear()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
@@ -202,14 +208,16 @@ class BotBackend:
 
                 arrow_frame = np.array(sct.grab(zones.arrow_zone))
                 gray = cv2.cvtColor(arrow_frame, cv2.COLOR_BGRA2GRAY)
-                keys = self._detect_keys(gray)
-
-                if not keys:
-                    bgr_scan = cv2.cvtColor(arrow_frame, cv2.COLOR_BGRA2BGR)
-                    cv2.imwrite(str(DEBUG_SCAN_PATH), bgr_scan)
-                    self.set_action("Стрелки не найдены")
+                if not self.can_scan:
                     time.sleep(self.scan_cooldown_sec)
                     continue
+
+                keys = self._detect_keys(gray)
+                if not keys:
+                    time.sleep(self.scan_cooldown_sec)
+                    continue
+
+                self.can_scan = False
 
                 if self.auto_keys_enabled:
                     self._press_keys_instant(keys)
@@ -219,7 +227,10 @@ class BotBackend:
                 if self.auto_space_enabled:
                     if not self._wait_perfect_and_space(sct, zones):
                         self.set_action("Perfect окно не найдено")
+                else:
+                    time.sleep(3.0)
 
+                self.can_scan = True
                 time.sleep(self.scan_cooldown_sec)
 
 
@@ -239,7 +250,7 @@ class AristocratUI:
         self.auto_keys_var = ctk.BooleanVar(value=True)
         self.auto_space_var = ctk.BooleanVar(value=True)
         self.rating_mode_var = ctk.StringVar(value="Круто")
-        self.precision_threshold_var = ctk.DoubleVar(value=0.65)
+        self.precision_threshold_var = ctk.DoubleVar(value=0.8)
 
         self.backend = BotBackend(self.append_log, self.set_status, self.set_last_action)
 
@@ -339,15 +350,15 @@ class AristocratUI:
 
         precision_row = ctk.CTkFrame(frame, fg_color="transparent")
         precision_row.pack(fill="x", padx=18, pady=(10, 2))
-        ctk.CTkLabel(precision_row, text="Точность (0.1 - 1.0)").pack(side="left")
+        ctk.CTkLabel(precision_row, text="Точность (0.8 - 1.0)").pack(side="left")
         self.precision_value_label = ctk.CTkLabel(precision_row, text=f"{self.precision_threshold_var.get():.2f}")
         self.precision_value_label.pack(side="right")
 
         self.precision_slider = ctk.CTkSlider(
             frame,
-            from_=0.1,
+            from_=0.8,
             to=1.0,
-            number_of_steps=90,
+            number_of_steps=20,
             variable=self.precision_threshold_var,
             progress_color="#8e44d9",
             button_color="#c77dff",
