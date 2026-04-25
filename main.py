@@ -1,9 +1,9 @@
-import ctypes
+import json
 import threading
 import time
-from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 import customtkinter as ctk
@@ -12,33 +12,8 @@ import mss
 import numpy as np
 import pydirectinput
 
-# ----------------------------- WinAPI -----------------------------
-user32 = ctypes.windll.user32
-
-
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-
-class RECT(ctypes.Structure):
-    _fields_ = [
-        ("left", ctypes.c_long),
-        ("top", ctypes.c_long),
-        ("right", ctypes.c_long),
-        ("bottom", ctypes.c_long),
-    ]
-
-
-# ----------------------------- Настройки -----------------------------
-WINDOW_TITLE_PART = "freestreet"
-WINDOW_CLASS_HINTS = ("UnityWndClass", "UnrealWindow", "FreeStreet")
-MIN_CLIENT_SIZE = (300, 200)
-
-# Базовые зоны относительно клиентской области 1920x1080
-ARROW_ZONE_REL = {"top": 760, "left": 450, "width": 1100, "height": 120}
-PERFECT_ZONE_REL = {"top": 745, "left": 808, "width": 30, "height": 120}
-
-# Узкая зона быстрого триггера (Smartdancer)
+CONFIG_PATH = Path("overlay_position.json")
+DEFAULT_REGION = {"x": 450, "y": 760, "width": 1100, "height": 120}
 TRIGGER_SLICE_WIDTH = 180
 
 RATING_PRESETS = {
@@ -49,60 +24,72 @@ RATING_PRESETS = {
 
 
 @dataclass(frozen=True)
-class WindowClientArea:
-    hwnd: int
-    title: str
+class CaptureRegion:
     left: int
     top: int
     width: int
     height: int
 
 
-@dataclass(frozen=True)
-class CaptureZones:
-    arrow_zone: dict
-    trigger_zone: dict
-    perfect_zone: dict
-
-
-class CalibrationOverlay:
-    """Простая красная рамка из 4 top-level окон (без прозрачной магии)."""
+class OverlayWindow:
+    """Прозрачный always-on-top оверлей с рамкой зоны захвата."""
 
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
-        self.windows: list[ctk.CTkToplevel] = []
+        self.color_default = "#ff2d2d"
+        self.color_success = "#1fd15d"
+        self._flash_job = None
 
-    def _make_bar(self, x: int, y: int, w: int, h: int) -> ctk.CTkToplevel:
-        win = ctk.CTkToplevel(self.root)
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        win.configure(fg_color="#ff2d2d")
-        win.geometry(f"{max(1, w)}x{max(1, h)}+{x}+{y}")
-        return win
+        self.window = ctk.CTkToplevel(root)
+        self.window.overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        self.window.configure(fg_color="white")
 
-    def show(self, left: int, top: int, width: int, height: int, duration_ms: int = 1800) -> None:
-        self.hide()
-        thickness = 3
-        self.windows.append(self._make_bar(left, top, width, thickness))
-        self.windows.append(self._make_bar(left, top + height - thickness, width, thickness))
-        self.windows.append(self._make_bar(left, top, thickness, height))
-        self.windows.append(self._make_bar(left + width - thickness, top, thickness, height))
-        self.root.after(duration_ms, self.hide)
+        # Для Windows: белый цвет становится прозрачным.
+        try:
+            self.window.attributes("-transparentcolor", "white")
+        except Exception:
+            pass
 
-    def hide(self) -> None:
-        for win in self.windows:
-            try:
-                win.destroy()
-            except Exception:
-                pass
-        self.windows.clear()
+        self.canvas = ctk.CTkCanvas(self.window, bg="white", bd=0, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.rect_id = self.canvas.create_rectangle(1, 1, 10, 10, outline=self.color_default, width=2)
+
+    def update_region(self, region: CaptureRegion) -> None:
+        width = max(20, int(region.width))
+        height = max(20, int(region.height))
+        left = int(region.left)
+        top = int(region.top)
+
+        self.window.geometry(f"{width}x{height}+{left}+{top}")
+        self.canvas.configure(width=width, height=height)
+        self.canvas.coords(self.rect_id, 1, 1, width - 2, height - 2)
+
+    def set_color(self, color: str) -> None:
+        self.canvas.itemconfigure(self.rect_id, outline=color)
+
+    def mark_failure(self) -> None:
+        self.set_color(self.color_default)
+
+    def flash_success(self, duration_ms: int = 120) -> None:
+        self.set_color(self.color_success)
+        if self._flash_job is not None:
+            self.root.after_cancel(self._flash_job)
+        self._flash_job = self.root.after(duration_ms, self.mark_failure)
 
 
 class BotBackend:
-    def __init__(self, logger: Callable[[str], None], status: Callable[[str], None], action: Callable[[str], None]):
+    def __init__(
+        self,
+        logger: Callable[[str], None],
+        status: Callable[[str], None],
+        action: Callable[[str], None],
+        vision_feedback: Callable[[bool], None],
+    ):
         self.log = logger
         self.set_status = status
         self.set_action = action
+        self.vision_feedback = vision_feedback
 
         self.auto_keys_enabled = True
         self.auto_space_enabled = True
@@ -112,14 +99,18 @@ class BotBackend:
         self.beat_lock_sec = 0.16
         self.is_active = False
 
-        self.zone_offset_x = 0
-        self.zone_offset_y = 0
+        self._region_lock = threading.Lock()
+        self._region = CaptureRegion(
+            left=DEFAULT_REGION["x"],
+            top=DEFAULT_REGION["y"],
+            width=DEFAULT_REGION["width"],
+            height=DEFAULT_REGION["height"],
+        )
 
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
 
         self.templates = self._load_arrow_templates("assets")
-        self.last_window: WindowClientArea | None = None
 
         pydirectinput.FAILSAFE = False
         pydirectinput.PAUSE = 0
@@ -140,132 +131,18 @@ class BotBackend:
             templates[key] = cv2.GaussianBlur(template, (3, 3), 0)
         return templates
 
-    @staticmethod
-    def _window_text(hwnd: int) -> str:
-        length = user32.GetWindowTextLengthW(hwnd)
-        buffer = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buffer, length + 1)
-        return buffer.value
-
-    @staticmethod
-    def _window_class(hwnd: int) -> str:
-        buffer = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, buffer, 256)
-        return buffer.value
-
-    @staticmethod
-    def _is_minimized(hwnd: int) -> bool:
-        return bool(user32.IsIconic(hwnd))
-
-    def find_game_window(self) -> WindowClientArea | None:
-        found: list[int] = []
-
-        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-        def enum_proc(hwnd, _lparam):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            title = self._window_text(hwnd)
-            if not title:
-                return True
-            class_name = self._window_class(hwnd)
-
-            title_match = WINDOW_TITLE_PART in title.lower()
-            class_match = any(hint.lower() in class_name.lower() for hint in WINDOW_CLASS_HINTS)
-            if title_match or class_match:
-                found.append(int(hwnd))
-            return True
-
-        user32.EnumWindows(enum_proc, 0)
-
-        for hwnd in found:
-            client = self.get_client_coords(hwnd)
-            if client is None:
-                continue
-            if client.width < MIN_CLIENT_SIZE[0] or client.height < MIN_CLIENT_SIZE[1]:
-                continue
-            title = self._window_text(hwnd)
-            return WindowClientArea(
-                hwnd=hwnd,
-                title=title,
-                left=client.left,
-                top=client.top,
-                width=client.width,
-                height=client.height,
+    def set_capture_region(self, left: int, top: int, width: int, height: int) -> None:
+        with self._region_lock:
+            self._region = CaptureRegion(
+                left=int(left),
+                top=int(top),
+                width=max(20, int(width)),
+                height=max(20, int(height)),
             )
-        return None
 
-    def get_client_coords(self, hwnd: int) -> WindowClientArea | None:
-        """
-        Возвращает координаты именно клиентской области окна (без рамки и заголовка).
-        Это критично для точного попадания по элементам на 1920x1080.
-        """
-        rect = RECT()
-        if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
-            return None
-
-        tl = POINT(rect.left, rect.top)
-        br = POINT(rect.right, rect.bottom)
-        if not user32.ClientToScreen(hwnd, ctypes.byref(tl)):
-            return None
-        if not user32.ClientToScreen(hwnd, ctypes.byref(br)):
-            return None
-
-        width = max(0, br.x - tl.x)
-        height = max(0, br.y - tl.y)
-        title = self._window_text(hwnd)
-        return WindowClientArea(hwnd=hwnd, title=title, left=tl.x, top=tl.y, width=width, height=height)
-
-    def _apply_zone(self, rel_zone: dict, client: WindowClientArea) -> dict:
-        return {
-            "left": int(client.left + rel_zone["left"] + self.zone_offset_x),
-            "top": int(client.top + rel_zone["top"] + self.zone_offset_y),
-            "width": int(rel_zone["width"]),
-            "height": int(rel_zone["height"]),
-        }
-
-    def _resolve_zones(self) -> CaptureZones | None:
-        window = self.find_game_window()
-        if window is None:
-            self.set_status("Статус: Окно не найдено")
-            self.set_action("Ожидание окна FreeStreet")
-            self.last_window = None
-            return None
-
-        self.last_window = window
-        self.set_status("Статус: Окно найдено")
-        self.log(
-            f"Окно: '{window.title}' | client(left={window.left}, top={window.top}, "
-            f"w={window.width}, h={window.height})"
-        )
-
-        if self._is_minimized(window.hwnd):
-            self.set_status("Статус: Окно найдено (свернуто)")
-            self.set_action("Разверните окно игры")
-            return None
-
-        fg = user32.GetForegroundWindow()
-        if int(fg) != window.hwnd:
-            self.set_action("Пытаюсь активировать окно")
-            user32.ShowWindow(window.hwnd, 9)  # SW_RESTORE
-            user32.SetForegroundWindow(window.hwnd)
-            time.sleep(0.03)
-            if int(user32.GetForegroundWindow()) != window.hwnd:
-                self.set_status("Статус: Окно найдено (не активно)")
-                self.set_action("Кликните по окну игры")
-                return None
-
-        self.set_status("Статус: Готов к работе")
-        self.set_action("Сканирование")
-
-        arrow_zone = self._apply_zone(ARROW_ZONE_REL, window)
-        perfect_zone = self._apply_zone(PERFECT_ZONE_REL, window)
-        trigger_zone = {
-            "left": arrow_zone["left"],
-            "top": arrow_zone["top"],
-            "width": min(TRIGGER_SLICE_WIDTH, arrow_zone["width"]),
-            "height": arrow_zone["height"],
-        }
-        return CaptureZones(arrow_zone=arrow_zone, trigger_zone=trigger_zone, perfect_zone=perfect_zone)
+    def get_capture_region(self) -> CaptureRegion:
+        with self._region_lock:
+            return self._region
 
     def update_settings(
         self,
@@ -273,8 +150,6 @@ class BotBackend:
         auto_space: bool,
         rating_mode: str,
         precision_threshold: float,
-        zone_offset_x: int,
-        zone_offset_y: int,
     ) -> None:
         self.auto_keys_enabled = auto_keys
         self.auto_space_enabled = auto_space
@@ -282,9 +157,6 @@ class BotBackend:
 
         preset = RATING_PRESETS.get(rating_mode, RATING_PRESETS["Круто"])
         self.perfect_brightness_threshold = preset["perfect_brightness"]
-
-        self.zone_offset_x = int(zone_offset_x)
-        self.zone_offset_y = int(zone_offset_y)
 
     def _detect_keys(self, gray_frame: np.ndarray) -> list[str]:
         blurred = cv2.GaussianBlur(gray_frame, (3, 3), 0)
@@ -314,11 +186,11 @@ class BotBackend:
             time.sleep(0.02)
             pydirectinput.keyUp(key, _pause=False)
 
-    def _wait_perfect_and_space(self, sct: mss.mss, zones: CaptureZones) -> bool:
+    def _wait_perfect_and_space(self, sct: mss.mss, region: dict) -> bool:
         timeout_sec = 1.8
         started = time.perf_counter()
         while self.is_active and not self._stop_event.is_set() and (time.perf_counter() - started) <= timeout_sec:
-            frame = np.array(sct.grab(zones.perfect_zone))
+            frame = np.array(sct.grab(region))
             bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             brightness = int(np.max(bgr))
             if brightness >= self.perfect_brightness_threshold:
@@ -330,13 +202,6 @@ class BotBackend:
                 return True
             time.sleep(0.001)
         return False
-
-    def get_calibration_zone(self) -> tuple[int, int, int, int] | None:
-        zones = self._resolve_zones()
-        if zones is None:
-            return None
-        z = zones.arrow_zone
-        return z["left"], z["top"], z["width"], z["height"]
 
     def start(self) -> None:
         if self.is_active:
@@ -365,32 +230,37 @@ class BotBackend:
         with mss.mss() as sct:
             vision_locked_until = 0.0
             while self.is_active and not self._stop_event.is_set():
-                zones = self._resolve_zones()
-                if zones is None:
-                    time.sleep(0.15)
-                    continue
+                region = self.get_capture_region()
+                monitor = {
+                    "left": region.left,
+                    "top": region.top,
+                    "width": region.width,
+                    "height": region.height,
+                }
 
                 now = time.perf_counter()
                 if now < vision_locked_until:
                     time.sleep(self.scan_cooldown_sec)
                     continue
 
-                # Smartdancer: быстрый просмотр узкой полоски
-                trig = np.array(sct.grab(zones.trigger_zone))
-                trig_gray = cv2.cvtColor(trig, cv2.COLOR_BGRA2GRAY)
-                if not self._trigger_has_arrow(trig_gray):
-                    time.sleep(self.scan_cooldown_sec)
-                    continue
-
-                # Мгновенный снимок всей полосы
-                full = np.array(sct.grab(zones.arrow_zone))
+                full = np.array(sct.grab(monitor))
                 full_gray = cv2.cvtColor(full, cv2.COLOR_BGRA2GRAY)
-                keys = self._detect_keys(full_gray)
 
-                if not keys:
+                trigger_width = min(TRIGGER_SLICE_WIDTH, full_gray.shape[1])
+                trigger_gray = full_gray[:, :trigger_width]
+
+                if not self._trigger_has_arrow(trigger_gray):
+                    self.vision_feedback(False)
                     time.sleep(self.scan_cooldown_sec)
                     continue
 
+                keys = self._detect_keys(full_gray)
+                if not keys:
+                    self.vision_feedback(False)
+                    time.sleep(self.scan_cooldown_sec)
+                    continue
+
+                self.vision_feedback(True)
                 vision_locked_until = time.perf_counter() + self.beat_lock_sec
 
                 if self.auto_keys_enabled:
@@ -399,7 +269,7 @@ class BotBackend:
                     self.set_action("Комбо: " + ", ".join(k.upper() for k in keys))
 
                 if self.auto_space_enabled:
-                    if not self._wait_perfect_and_space(sct, zones):
+                    if not self._wait_perfect_and_space(sct, monitor):
                         self.set_action("Perfect не найден")
 
 
@@ -410,23 +280,30 @@ class AristocratUI:
 
         self.root = ctk.CTk()
         self.root.title("BottomBot DX")
-        self.root.geometry("520x360")
-        self.root.minsize(480, 320)
+        self.root.geometry("560x520")
+        self.root.minsize(540, 500)
         self.root.resizable(True, True)
         self.root.configure(fg_color="#11081f")
+        self.root.attributes("-topmost", True)
 
         self.auto_keys_var = ctk.BooleanVar(value=True)
         self.auto_space_var = ctk.BooleanVar(value=True)
         self.rating_mode_var = ctk.StringVar(value="Круто")
         self.precision_threshold_var = ctk.DoubleVar(value=0.82)
-        self.offset_x_var = ctk.IntVar(value=0)
-        self.offset_y_var = ctk.IntVar(value=0)
 
-        self.backend = BotBackend(self.append_log, self.set_status, self.set_last_action)
-        self.overlay = CalibrationOverlay(self.root)
+        saved = self._load_region_config()
+        self.region_x_var = ctk.IntVar(value=saved["x"])
+        self.region_y_var = ctk.IntVar(value=saved["y"])
+        self.region_w_var = ctk.IntVar(value=saved["width"])
+        self.region_h_var = ctk.IntVar(value=saved["height"])
+
+        self.overlay = OverlayWindow(self.root)
+        self.backend = BotBackend(self.append_log, self.set_status, self.set_last_action, self.on_vision_feedback)
 
         self._build_layout()
+        self._bind_region_traces()
         self._sync_backend()
+        self._apply_region_to_overlay_and_backend()
 
     def _build_layout(self) -> None:
         self.root.grid_rowconfigure(2, weight=1)
@@ -438,8 +315,8 @@ class AristocratUI:
         self.start_btn = ctk.CTkButton(top, text="Запустить", command=self.toggle_bot, fg_color="#5d2e8c")
         self.start_btn.pack(side="left", padx=8, pady=8)
 
-        self.calib_btn = ctk.CTkButton(top, text="Калибровка", command=self.show_calibration, fg_color="#9b2335")
-        self.calib_btn.pack(side="left", padx=8, pady=8)
+        save_btn = ctk.CTkButton(top, text="Сохранить позицию", command=self.save_region_config, fg_color="#136f48")
+        save_btn.pack(side="left", padx=8, pady=8)
 
         self.status_label = ctk.CTkLabel(top, text="Статус: Остановлен", text_color="#e8ddff")
         self.status_label.pack(side="left", padx=10)
@@ -489,22 +366,47 @@ class AristocratUI:
             command=lambda _v: self._sync_backend(),
         ).pack(side="right", fill="x", expand=True, padx=(10, 0))
 
-        offset_row = ctk.CTkFrame(frame, fg_color="transparent")
-        offset_row.pack(fill="x", padx=14, pady=(8, 8))
-
-        ctk.CTkLabel(offset_row, text="Смещение X").grid(row=0, column=0, sticky="w")
-        ctk.CTkEntry(offset_row, textvariable=self.offset_x_var, width=70).grid(row=0, column=1, padx=6)
-
-        ctk.CTkLabel(offset_row, text="Смещение Y").grid(row=0, column=2, sticky="w", padx=(14, 0))
-        ctk.CTkEntry(offset_row, textvariable=self.offset_y_var, width=70).grid(row=0, column=3, padx=6)
-
-        ctk.CTkButton(offset_row, text="Применить", width=90, command=self._sync_backend).grid(row=0, column=4, padx=(8, 0))
-
         ctk.CTkLabel(
             frame,
-            text="Нажми 'Калибровка' для красной рамки зоны стрелок.",
+            text="Калибровка зоны захвата (рамка двигается мгновенно):",
             text_color="#cdb6ff",
-        ).pack(anchor="w", padx=14, pady=(4, 10))
+        ).pack(anchor="w", padx=14, pady=(10, 6))
+
+        sliders = ctk.CTkFrame(frame, fg_color="transparent")
+        sliders.pack(fill="x", padx=14, pady=(0, 8))
+
+        self._add_region_control(sliders, "X", self.region_x_var, 0, 0, 5000)
+        self._add_region_control(sliders, "Y", self.region_y_var, 1, 0, 3000)
+        self._add_region_control(sliders, "Ширина", self.region_w_var, 2, 20, 5000)
+        self._add_region_control(sliders, "Высота", self.region_h_var, 3, 20, 3000)
+
+    def _add_region_control(
+        self,
+        parent,
+        title: str,
+        var: ctk.IntVar,
+        row: int,
+        min_value: int,
+        max_value: int,
+    ) -> None:
+        line = ctk.CTkFrame(parent, fg_color="transparent")
+        line.grid(row=row, column=0, sticky="ew", pady=4)
+        line.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(line, text=title, width=70).grid(row=0, column=0, sticky="w")
+
+        slider = ctk.CTkSlider(
+            line,
+            from_=min_value,
+            to=max_value,
+            number_of_steps=max_value - min_value,
+            command=lambda value, v=var: v.set(int(value)),
+        )
+        slider.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        slider.set(var.get())
+
+        entry = ctk.CTkEntry(line, textvariable=var, width=80)
+        entry.grid(row=0, column=2, sticky="e")
 
     def _build_logs_tab(self, tab) -> None:
         tab.grid_rowconfigure(0, weight=1)
@@ -514,14 +416,29 @@ class AristocratUI:
         self.log_box.insert("end", "[INIT] BottomBot DX logs\n")
         self.log_box.configure(state="disabled")
 
+    def _bind_region_traces(self) -> None:
+        for var in (self.region_x_var, self.region_y_var, self.region_w_var, self.region_h_var):
+            var.trace_add("write", self._on_region_change)
+
+    def _on_region_change(self, *_args) -> None:
+        self._apply_region_to_overlay_and_backend()
+
+    def _apply_region_to_overlay_and_backend(self) -> None:
+        region = CaptureRegion(
+            left=int(self.region_x_var.get()),
+            top=int(self.region_y_var.get()),
+            width=max(20, int(self.region_w_var.get())),
+            height=max(20, int(self.region_h_var.get())),
+        )
+        self.overlay.update_region(region)
+        self.backend.set_capture_region(region.left, region.top, region.width, region.height)
+
     def _sync_backend(self) -> None:
         self.backend.update_settings(
             auto_keys=bool(self.auto_keys_var.get()),
             auto_space=bool(self.auto_space_var.get()),
             rating_mode=self.rating_mode_var.get(),
             precision_threshold=float(self.precision_threshold_var.get()),
-            zone_offset_x=int(self.offset_x_var.get()),
-            zone_offset_y=int(self.offset_y_var.get()),
         )
 
     def append_log(self, message: str) -> None:
@@ -542,16 +459,35 @@ class AristocratUI:
     def set_last_action(self, action_text: str) -> None:
         self.root.after(0, lambda: self.action_label.configure(text=f"Последнее действие: {action_text}"))
 
-    def show_calibration(self) -> None:
-        self._sync_backend()
-        zone = self.backend.get_calibration_zone()
-        if zone is None:
-            self.append_log("Калибровка: окно не найдено")
-            self.set_status("Статус: Окно не найдено")
-            return
-        left, top, width, height = zone
-        self.overlay.show(left, top, width, height)
-        self.append_log(f"Калибровка: рамка left={left}, top={top}, width={width}, height={height}")
+    def on_vision_feedback(self, has_arrows: bool) -> None:
+        if has_arrows:
+            self.root.after(0, self.overlay.flash_success)
+        else:
+            self.root.after(0, self.overlay.mark_failure)
+
+    def save_region_config(self) -> None:
+        data = {
+            "x": int(self.region_x_var.get()),
+            "y": int(self.region_y_var.get()),
+            "width": max(20, int(self.region_w_var.get())),
+            "height": max(20, int(self.region_h_var.get())),
+        }
+        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.append_log(f"Позиция сохранена: {data}")
+
+    def _load_region_config(self) -> dict:
+        if not CONFIG_PATH.exists():
+            return DEFAULT_REGION.copy()
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return {
+                "x": int(raw.get("x", DEFAULT_REGION["x"])),
+                "y": int(raw.get("y", DEFAULT_REGION["y"])),
+                "width": max(20, int(raw.get("width", DEFAULT_REGION["width"]))),
+                "height": max(20, int(raw.get("height", DEFAULT_REGION["height"]))),
+            }
+        except Exception:
+            return DEFAULT_REGION.copy()
 
     def toggle_bot(self) -> None:
         if self.backend.is_active:
@@ -559,6 +495,7 @@ class AristocratUI:
             self.start_btn.configure(text="Запустить", fg_color="#5d2e8c")
         else:
             self._sync_backend()
+            self._apply_region_to_overlay_and_backend()
             self.backend.start()
             self.start_btn.configure(text="Остановить", fg_color="#8b1e3f")
 
