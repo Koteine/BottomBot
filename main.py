@@ -29,7 +29,7 @@ class SmartDancerPro:
 
         self.zones = Zones(
             arrow_zone={"top": 650, "left": 400, "width": 800, "height": 250},
-            perfect_zone={"top": 725, "left": 795, "width": 20, "height": 30},
+            perfect_zone={"top": 730, "left": 812, "width": 15, "height": 20},
         )
 
         self.match_threshold = 0.85
@@ -418,15 +418,20 @@ def space_worker(
 ):
     pyautogui.PAUSE = 0
     pyautogui.FAILSAFE = False
+    peak_threshold = 50
+    cooldown_seconds = 1.5
+    prev_blue_score = 0
 
     with mss.mss() as sct:
         while not stop_event.is_set():
             if not auto_space.value:
                 shared_state.value = STATE_SCANNING
+                prev_blue_score = 0
                 time.sleep(0.01)
                 continue
 
             if shared_state.value == STATE_SCANNING:
+                prev_blue_score = 0
                 time.sleep(0.002)
                 continue
 
@@ -444,18 +449,20 @@ def space_worker(
             mask = cv2.inRange(hsv, lower_blue, upper_blue)
             blue_score = int(np.sum(mask == 255))
 
-            if blue_score > 50:
+            if blue_score >= peak_threshold and blue_score < prev_blue_score:
                 delay = space_delay_ms.value / 1000.0
                 if delay > 0:
                     time.sleep(delay)
 
                 pyautogui.press("space")
-                log_queue.put(
-                    f"Perfect blue_score={blue_score} -> Space (delay {space_delay_ms.value}ms, calib {space_calibration_px.value}px)"
-                )
+                log_queue.put(f"Space! (score: {blue_score}, delay {space_delay_ms.value}ms, calib {space_calibration_px.value}px)")
 
                 shared_state.value = STATE_SCANNING
-                time.sleep(1.0)
+                prev_blue_score = 0
+                time.sleep(cooldown_seconds)
+                continue
+
+            prev_blue_score = blue_score
 
             time.sleep(0.001)
 
