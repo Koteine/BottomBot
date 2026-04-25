@@ -29,16 +29,16 @@ class SmartDancerPro:
 
         self.zones = Zones(
             arrow_zone={"top": 650, "left": 400, "width": 800, "height": 250},
-            perfect_zone={"top": 505, "left": 775, "width": 50, "height": 50},
+            perfect_zone={"top": 725, "left": 795, "width": 20, "height": 30},
         )
 
         self.match_threshold = 0.85
-        self.space_brightness_peak = 240.0
         self.dedupe_radius_px = 10
 
         self.auto_keys_var = ctk.BooleanVar(value=True)
         self.auto_space_var = ctk.BooleanVar(value=True)
         self.space_delay_var = ctk.IntVar(value=0)
+        self.space_calibration_var = ctk.IntVar(value=0)
 
         self.is_active = False
         self.worker_processes = []
@@ -49,6 +49,7 @@ class SmartDancerPro:
         self.shared_auto_keys = mp.Value("b", True)
         self.shared_auto_space = mp.Value("b", True)
         self.shared_space_delay_ms = mp.Value("i", 0)
+        self.shared_space_calibration_px = mp.Value("i", 0)
         self.shared_state = mp.Value("i", STATE_SCANNING)
         self.stop_event = mp.Event()
 
@@ -103,6 +104,29 @@ class SmartDancerPro:
         self.delay_entry.bind("<Return>", self._on_delay_entry)
         self.delay_entry.bind("<FocusOut>", self._on_delay_entry)
 
+        calibration_frame = ctk.CTkFrame(self.window)
+        calibration_frame.pack(padx=14, pady=(0, 10), fill="x")
+
+        ctk.CTkLabel(calibration_frame, text="Space Calibration (px): -20 .. 20").pack(
+            anchor="w", padx=10, pady=(8, 2)
+        )
+
+        self.calibration_slider = ctk.CTkSlider(
+            calibration_frame,
+            from_=-20,
+            to=20,
+            number_of_steps=40,
+            command=self._on_calibration_slider,
+        )
+        self.calibration_slider.pack(fill="x", padx=10, pady=(0, 8))
+        self.calibration_slider.set(0)
+
+        self.calibration_entry = ctk.CTkEntry(calibration_frame)
+        self.calibration_entry.pack(fill="x", padx=10, pady=(0, 10))
+        self.calibration_entry.insert(0, "0")
+        self.calibration_entry.bind("<Return>", self._on_calibration_entry)
+        self.calibration_entry.bind("<FocusOut>", self._on_calibration_entry)
+
         zone_text = (
             f"arrow_zone: {self.zones.arrow_zone}\\n"
             f"perfect_zone (tiny focus): {self.zones.perfect_zone}"
@@ -133,6 +157,8 @@ class SmartDancerPro:
         self.shared_auto_keys.value = bool(self.auto_keys_var.get())
         self.shared_auto_space.value = bool(self.auto_space_var.get())
         self.shared_space_delay_ms.value = int(self.space_delay_var.get())
+        self.shared_space_calibration_px.value = int(self.space_calibration_var.get())
+        self._refresh_zone_label()
 
     def _on_delay_slider(self, value):
         ms = int(round(float(value)))
@@ -154,6 +180,36 @@ class SmartDancerPro:
         self.delay_entry.delete(0, "end")
         self.delay_entry.insert(0, str(ms))
         self._sync_runtime_settings()
+
+    def _on_calibration_slider(self, value):
+        offset = int(round(float(value)))
+        self.space_calibration_var.set(offset)
+        self.calibration_entry.delete(0, "end")
+        self.calibration_entry.insert(0, str(offset))
+        self._sync_runtime_settings()
+
+    def _on_calibration_entry(self, _event=None):
+        raw = self.calibration_entry.get().strip() or "0"
+        try:
+            offset = int(raw)
+        except ValueError:
+            offset = self.space_calibration_var.get()
+
+        offset = max(-20, min(20, offset))
+        self.space_calibration_var.set(offset)
+        self.calibration_slider.set(offset)
+        self.calibration_entry.delete(0, "end")
+        self.calibration_entry.insert(0, str(offset))
+        self._sync_runtime_settings()
+
+    def _refresh_zone_label(self):
+        calibrated_zone = dict(self.zones.perfect_zone)
+        calibrated_zone["left"] += int(self.space_calibration_var.get())
+        zone_text = (
+            f"arrow_zone: {self.zones.arrow_zone}\\n"
+            f"perfect_zone (tiny focus): {calibrated_zone}"
+        )
+        self.zone_label.configure(text=zone_text)
 
     def toggle(self):
         if self.is_active:
@@ -193,9 +249,9 @@ class SmartDancerPro:
             target=space_worker,
             args=(
                 self.zones.perfect_zone,
-                self.space_brightness_peak,
                 self.shared_auto_space,
                 self.shared_space_delay_ms,
+                self.shared_space_calibration_px,
                 self.shared_state,
                 self.command_queue,
                 self.log_queue,
@@ -352,9 +408,9 @@ def key_worker(
 
 def space_worker(
     perfect_zone,
-    brightness_threshold,
     auto_space,
     space_delay_ms,
+    space_calibration_px,
     shared_state,
     command_queue,
     log_queue,
@@ -377,26 +433,29 @@ def space_worker(
             while not command_queue.empty():
                 _ = command_queue.get()
 
-            frame = np.array(sct.grab(perfect_zone))
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-            mean_brightness = float(np.mean(gray))
+            current_zone = dict(perfect_zone)
+            current_zone["left"] += int(space_calibration_px.value)
 
-            if mean_brightness > brightness_threshold:
+            frame = np.array(sct.grab(current_zone))
+            img = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            lower_blue = np.array([100, 150, 50])
+            upper_blue = np.array([140, 255, 255])
+            mask = cv2.inRange(hsv, lower_blue, upper_blue)
+            blue_score = int(np.sum(mask == 255))
+
+            if blue_score > 50:
                 delay = space_delay_ms.value / 1000.0
                 if delay > 0:
                     time.sleep(delay)
 
                 pyautogui.press("space")
-
-                if delay < 0:
-                    # Отрицательная задержка не может нажать раньше света, но логируем её для настройки.
-                    log_queue.put(
-                        f"Perfect пик={mean_brightness:.1f} (delay {space_delay_ms.value}ms, ранний сдвиг ограничен физически)"
-                    )
-                else:
-                    log_queue.put(f"Perfect пик={mean_brightness:.1f} -> Space (delay {space_delay_ms.value}ms)")
+                log_queue.put(
+                    f"Perfect blue_score={blue_score} -> Space (delay {space_delay_ms.value}ms, calib {space_calibration_px.value}px)"
+                )
 
                 shared_state.value = STATE_SCANNING
+                time.sleep(1.0)
 
             time.sleep(0.001)
 
