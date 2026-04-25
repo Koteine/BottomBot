@@ -21,16 +21,15 @@ class InstantSmartDancer:
     def __init__(self):
         self.window = ctk.CTk()
         self.window.title("Instant Smart Dancer (1600x900)")
-        self.window.geometry("620x520")
+        self.window.geometry("620x560")
         self.window.attributes("-topmost", True)
 
         self.zones = Zones(
-            arrow_zone={"top": 740, "left": 400, "width": 800, "height": 100},
-            perfect_zone={"top": 728, "left": 810, "width": 15, "height": 25},
+            arrow_zone={"top": 740, "left": 300, "width": 1000, "height": 160},
+            perfect_zone={"top": 728, "left": 810, "width": 1, "height": 25},
         )
 
-        self.threshold = 0.9
-        self.dedupe_radius_px = 10
+        self.threshold = 0.7
 
         self.auto_keys_var = ctk.BooleanVar(value=True)
         self.auto_space_var = ctk.BooleanVar(value=True)
@@ -53,7 +52,10 @@ class InstantSmartDancer:
         self.start_button.pack(pady=(14, 8))
 
         self.status_label = ctk.CTkLabel(self.window, text="Статус: Выключен")
-        self.status_label.pack(pady=(0, 10))
+        self.status_label.pack(pady=(0, 6))
+
+        self.last_action_label = ctk.CTkLabel(self.window, text="Последнее действие: Ожидание")
+        self.last_action_label.pack(pady=(0, 10))
 
         self.auto_keys_switch = ctk.CTkSwitch(
             self.window,
@@ -79,7 +81,7 @@ class InstantSmartDancer:
         self.zone_label = ctk.CTkLabel(self.window, text=zone_text)
         self.zone_label.pack(pady=(0, 10))
 
-        self.log_box = ctk.CTkTextbox(self.window, width=580, height=330)
+        self.log_box = ctk.CTkTextbox(self.window, width=580, height=320)
         self.log_box.pack(padx=14, pady=(0, 14), fill="both", expand=True)
         self.log_box.insert("end", "Instant Smart Dancer log\n")
         self.log_box.configure(state="disabled")
@@ -91,6 +93,9 @@ class InstantSmartDancer:
         self.log_box.insert("end", line)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+
+    def _set_last_action(self, message):
+        self.last_action_label.configure(text=f"Последнее действие: {message}")
 
     def _sync_runtime_settings(self):
         self.auto_keys_enabled = bool(self.auto_keys_var.get())
@@ -113,7 +118,7 @@ class InstantSmartDancer:
             templates[direction] = template
         return templates
 
-    def detect_combo(self, gray_frame):
+    def detect_keys(self, gray_frame):
         detections = []
         for direction, template in self.templates.items():
             result = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
@@ -125,83 +130,68 @@ class InstantSmartDancer:
                         "direction": direction,
                         "center_x": int(x + w / 2),
                         "center_y": int(y + h / 2),
-                        "score": float(result[y, x]),
                     }
                 )
 
-        if not detections:
-            return []
-
-        detections.sort(key=lambda item: item["score"], reverse=True)
-        deduped = []
-        for item in detections:
-            duplicate = False
-            for kept in deduped:
-                if (
-                    abs(item["center_x"] - kept["center_x"]) <= self.dedupe_radius_px
-                    and abs(item["center_y"] - kept["center_y"]) <= self.dedupe_radius_px
-                ):
-                    duplicate = True
-                    break
-            if not duplicate:
-                deduped.append(item)
-
-        deduped.sort(key=lambda item: item["center_x"])
-        return deduped
+        detections.sort(key=lambda item: item["center_x"])
+        return detections
 
     @staticmethod
-    def press_combo_instant(combo):
-        start = time.perf_counter()
-        for item in combo:
-            pydirectinput.press(item["direction"])
-            time.sleep(0.001)
-        return time.perf_counter() - start
+    def press_keys_instant(found_keys):
+        for key in found_keys:
+            pydirectinput.press(key, _pause=False)
 
     def wait_for_perfect_and_space(self, sct):
-        while self.is_active and not self.stop_event.is_set() and self.auto_space_enabled:
+        timeout_sec = 2.0
+        start = time.perf_counter()
+
+        while (
+            self.is_active
+            and not self.stop_event.is_set()
+            and self.auto_space_enabled
+            and (time.perf_counter() - start) <= timeout_sec
+        ):
             perfect_frame = np.array(sct.grab(self.zones.perfect_zone))
             perfect_bgr = cv2.cvtColor(perfect_frame, cv2.COLOR_BGRA2BGR)
-            max_val = int(np.max(perfect_bgr))
-            if max_val > 245:
-                pydirectinput.press("space")
-                self.window.after(0, self._append_log, "Perfect detected (max>245) -> SPACE")
-                break
-            time.sleep(0.0005)
+            brightness = int(np.max(perfect_bgr))
+
+            if brightness > 240:
+                pydirectinput.press("space", _pause=False)
+                self.window.after(0, self._set_last_action, "Perfect > 240 -> SPACE")
+                self.window.after(0, self._append_log, f"Perfect detected ({brightness}) -> SPACE")
+                return
+
+            time.sleep(0.001)
+
+        self.window.after(0, self._set_last_action, "Perfect не найден за 2с")
 
     def worker_loop(self):
-        last_signature = None
         with mss.mss() as sct:
             while self.is_active and not self.stop_event.is_set():
                 arrow_frame = np.array(sct.grab(self.zones.arrow_zone))
                 gray_frame = cv2.cvtColor(arrow_frame, cv2.COLOR_BGRA2GRAY)
-                combo = self.detect_combo(gray_frame)
+                combo = self.detect_keys(gray_frame)
 
                 if not combo:
-                    time.sleep(0.0008)
+                    self.window.after(0, self._set_last_action, "Стрелки не найдены")
+                    time.sleep(0.001)
                     continue
 
-                signature = tuple((item["direction"], item["center_x"]) for item in combo)
-                if signature == last_signature:
-                    time.sleep(0.0008)
-                    continue
-                last_signature = signature
+                found_keys = [item["direction"] for item in combo]
+                combo_names = [key.upper() for key in found_keys]
 
-                combo_names = [item["direction"].upper() for item in combo]
-                input_time = 0.0
+                self.window.after(0, self._set_last_action, f"Найдены стрелки: {combo_names}")
 
                 if self.auto_keys_enabled:
-                    input_time = self.press_combo_instant(combo)
-
-                self.window.after(
-                    0,
-                    self._append_log,
-                    f"Комбинация {combo_names} введена за {input_time:.2f} сек. Ожидаю Perfect...",
-                )
+                    self.press_keys_instant(found_keys)
+                    self.window.after(0, self._set_last_action, f"Нажаты стрелки: {combo_names}")
+                    self.window.after(0, self._append_log, f"Комбинация нажата мгновенно: {combo_names}")
 
                 if self.auto_space_enabled:
+                    self.window.after(0, self._set_last_action, "Мониторинг Perfect (до 2с)")
                     self.wait_for_perfect_and_space(sct)
 
-                time.sleep(0.0008)
+                time.sleep(0.001)
 
     def toggle(self):
         if self.is_active:
@@ -218,7 +208,8 @@ class InstantSmartDancer:
 
         self.start_button.configure(text="СТОП", fg_color="red")
         self.status_label.configure(text="Статус: Работает")
-        self._append_log("Бот запущен (Low Latency режим)")
+        self._set_last_action("Бот запущен")
+        self._append_log("Бот запущен (Instant режим)")
 
     def stop(self):
         self.is_active = False
@@ -229,6 +220,7 @@ class InstantSmartDancer:
 
         self.start_button.configure(text="СТАРТ", fg_color=["#3a7ebf", "#1f538d"])
         self.status_label.configure(text="Статус: Выключен")
+        self._set_last_action("Бот остановлен")
         self._append_log("Бот остановлен")
 
 
