@@ -1,104 +1,215 @@
 import threading
 import time
-import tkinter as tk
 from datetime import datetime
+from pathlib import Path
 
+import customtkinter as ctk
 import cv2
 import keyboard
 import mss
 import numpy as np
 
+# Зашитые координаты (идеальные)
 SCAN_AREA = {"top": 690, "left": 450, "width": 742, "height": 65}
 PERFECT_ZONE = {"top": 715, "left": 810, "width": 20, "height": 20}
-THRESHOLD = 0.7
+
+TEMPLATE_THRESHOLD = 0.70
 PERFECT_BRIGHTNESS = 230
+KEY_PRESS_DELAY = 0.02
 
 
-def load_templates() -> dict[str, np.ndarray]:
-    files = {"left": "assets/left.png", "down": "assets/down.png", "up": "assets/up.png", "right": "assets/right.png"}
-    out: dict[str, np.ndarray] = {}
-    for name, path in files.items():
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(path)
-        out[name] = img
-    return out
+class SmartDancerBot:
+    def __init__(self, log_callback):
+        self.log = log_callback
+        self._running = False
+        self._thread = None
+        self._lock = threading.Lock()
+        self.templates = self._load_templates()
 
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._running
 
-def detect_arrows(gray: np.ndarray, templates: dict[str, np.ndarray]) -> list[str]:
-    hits = []
-    for direction, template in templates.items():
-        result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-        ys, xs = np.where(result >= THRESHOLD)
-        for y, x in zip(ys, xs):
-            hits.append((int(x), direction, float(result[y, x])))
-    uniq = {}
-    for x, direction, score in sorted(hits, key=lambda i: i[2], reverse=True):
-        bucket = x // 8
-        if bucket not in uniq:
-            uniq[bucket] = (x, direction)
-    return [d for x, d in sorted(uniq.values(), key=lambda i: i[0])]
+    def start(self) -> None:
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
 
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        self.log("Бот запущен")
 
-class Bot:
-    def __init__(self, log):
-        self.log = log
-        self.run_flag = False
-        self.templates = load_templates()
+    def stop(self) -> None:
+        with self._lock:
+            self._running = False
+        self.log("Бот остановлен")
 
-    def start(self):
-        if self.run_flag:
+    def _load_templates(self) -> dict[str, np.ndarray]:
+        assets_dir = Path(__file__).resolve().parent / "assets"
+        files = {
+            "left": assets_dir / "left.png",
+            "down": assets_dir / "down.png",
+            "up": assets_dir / "up.png",
+            "right": assets_dir / "right.png",
+        }
+
+        templates: dict[str, np.ndarray] = {}
+        for direction, path in files.items():
+            image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                self.log(f"Ошибка assets: не найден файл {path.name}")
+                continue
+            templates[direction] = image
+
+        if not templates:
+            self.log("Ошибка assets: шаблоны не загружены (bot не сможет искать стрелки)")
+
+        return templates
+
+    @staticmethod
+    def _detect_arrows(gray_frame: np.ndarray, templates: dict[str, np.ndarray]) -> list[str]:
+        candidates: list[tuple[int, str, float]] = []
+
+        for direction, template in templates.items():
+            result = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
+            ys, xs = np.where(result >= TEMPLATE_THRESHOLD)
+            for y, x in zip(ys, xs):
+                candidates.append((int(x), direction, float(result[y, x])))
+
+        # Убираем дубли, сохраняя самые сильные срабатывания в близких позициях.
+        unique_by_bucket: dict[int, tuple[int, str]] = {}
+        for x, direction, score in sorted(candidates, key=lambda item: item[2], reverse=True):
+            bucket = x // 8
+            if bucket not in unique_by_bucket:
+                unique_by_bucket[bucket] = (x, direction)
+
+        sorted_hits = sorted(unique_by_bucket.values(), key=lambda item: item[0])
+        return [direction for _, direction in sorted_hits]
+
+    @staticmethod
+    def _frame_to_gray(sct: mss.mss, region: dict[str, int]) -> np.ndarray:
+        frame = np.array(sct.grab(region))
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+
+    def _tap_chain(self, chain: list[str]) -> None:
+        self.log("Нажимаю цепочку: " + " ".join(chain))
+        for key_name in chain:
+            keyboard.press_and_release(key_name)
+            time.sleep(KEY_PRESS_DELAY)
+
+    def _wait_and_hit_perfect(self, sct: mss.mss) -> None:
+        while self.is_running:
+            perfect_gray = self._frame_to_gray(sct, PERFECT_ZONE)
+            if float(np.mean(perfect_gray)) > PERFECT_BRIGHTNESS:
+                keyboard.press_and_release("space")
+                self.log("Удар в Perfect")
+                return
+            time.sleep(0.005)
+
+    def _loop(self) -> None:
+        if not self.templates:
+            self.log("Остановка: нет шаблонов для распознавания")
+            with self._lock:
+                self._running = False
             return
-        self.run_flag = True
-        threading.Thread(target=self.loop, daemon=True).start()
 
-    def stop(self):
-        self.run_flag = False
+        try:
+            with mss.mss() as sct:
+                while self.is_running:
+                    scan_gray = self._frame_to_gray(sct, SCAN_AREA)
+                    chain = self._detect_arrows(scan_gray, self.templates)
 
-    def loop(self):
-        with mss.mss() as sct:
-            while self.run_flag:
-                gray = cv2.cvtColor(np.array(sct.grab(SCAN_AREA)), cv2.COLOR_BGRA2GRAY)
-                chain = detect_arrows(gray, self.templates)
-                if not chain:
-                    continue
-                for key in chain:
-                    keyboard.press_and_release(key)
-                self.log("Стрелки: " + " ".join(chain))
-                while self.run_flag:
-                    if np.mean(cv2.cvtColor(np.array(sct.grab(PERFECT_ZONE)), cv2.COLOR_BGRA2GRAY)) > PERFECT_BRIGHTNESS:
-                        keyboard.press_and_release("space")
-                        self.log("SPACE")
-                        break
+                    if not chain:
+                        time.sleep(0.005)
+                        continue
+
+                    self.log("Вижу стрелки: " + " ".join(chain))
+                    self._tap_chain(chain)
+                    self._wait_and_hit_perfect(sct)
+
+        except Exception as error:
+            self.log(f"Ошибка в рабочем потоке: {error}")
+        finally:
+            with self._lock:
+                self._running = False
 
 
-class UI:
+class AppUI:
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("BottomBot")
-        self.root.geometry("420x260")
-        self.bot = Bot(self.log)
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
 
-        self.btn = tk.Button(self.root, text="СТАРТ", command=self.toggle, font=("Arial", 12, "bold"))
-        self.btn.pack(fill="x", padx=8, pady=8)
+        self.root = ctk.CTk()
+        self.root.title("SmartDancer BottomBot")
+        self.root.geometry("560x420")
+        self.root.minsize(520, 360)
 
-        self.box = tk.Text(self.root, height=12)
-        self.box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.bot = SmartDancerBot(self.log)
 
-    def log(self, text: str):
-        line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {text}\n"
-        self.root.after(0, lambda: (self.box.insert("end", line), self.box.see("end")))
+        self.header = ctk.CTkLabel(
+            self.root,
+            text="SmartDancer",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        self.header.pack(pady=(14, 10))
 
-    def toggle(self):
-        if self.bot.run_flag:
-            self.bot.stop()
-            self.btn.config(text="СТАРТ")
-            self.log("Остановлено")
-        else:
-            self.bot.start()
-            self.btn.config(text="СТОП")
-            self.log("Запущено")
+        self.controls = ctk.CTkFrame(self.root)
+        self.controls.pack(fill="x", padx=14, pady=(0, 10))
+
+        self.start_button = ctk.CTkButton(
+            self.controls,
+            text="СТАРТ",
+            width=180,
+            height=40,
+            command=self.start_bot,
+            font=ctk.CTkFont(size=15, weight="bold"),
+        )
+        self.start_button.pack(side="left", padx=10, pady=10)
+
+        self.stop_button = ctk.CTkButton(
+            self.controls,
+            text="СТОП",
+            width=180,
+            height=40,
+            command=self.stop_bot,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#8B1E2D",
+            hover_color="#A32537",
+        )
+        self.stop_button.pack(side="left", padx=10, pady=10)
+
+        self.log_box = ctk.CTkTextbox(self.root, wrap="word")
+        self.log_box.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.log_box.configure(state="disabled")
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.log("Готов к работе")
+
+    def log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = f"[{timestamp}] {message}\n"
+
+        def _append():
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", line)
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+
+        self.root.after(0, _append)
+
+    def start_bot(self) -> None:
+        self.bot.start()
+
+    def stop_bot(self) -> None:
+        self.bot.stop()
+
+    def on_close(self) -> None:
+        self.bot.stop()
+        self.root.after(100, self.root.destroy)
 
 
 if __name__ == "__main__":
-    UI().root.mainloop()
+    app = AppUI()
+    app.root.mainloop()
