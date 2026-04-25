@@ -6,3 +6,4 @@ customtkinter
 pillow
 keyboard
 pydirectinput
+pygetwindow
